@@ -1,0 +1,21 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# runtime artifacts (local bus state — never commit)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+artifacts/
+*.token
+
+# env / secrets
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
