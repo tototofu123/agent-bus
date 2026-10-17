@@ -1,0 +1,17 @@
+[package]
+name = "busd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+proto = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+ulid = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }

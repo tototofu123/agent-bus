@@ -1,0 +1,480 @@
+//! `bus` — the universal adapter. One-shot commands over TCP loopback NDJSON.
+
+use anyhow::{anyhow, Context, Result};
+use clap::{Args, Parser, Subcommand};
+use proto::{decode_line, encode_line, Agent};
+use serde_json::{json, Value};
+use std::io::Write as _;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
+
+#[derive(Parser)]
+#[command(name = "bus", version, about = "agent-bus client — rooms for agents")]
+struct Cli {
+    /// daemon port (AGENT_BUS_PORT overrides; default 47113)
+    #[arg(long, global = true)]
+    port: Option<u16>,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Register an agent identity; prints + stores the token
+    Register(RegisterArgs),
+    /// Join a room
+    Join(RoomArgs),
+    /// Leave a room
+    Leave(RoomArgs),
+    /// Send a typed message
+    Send(SendArgs),
+    /// Block until a message for me arrives (this is push, as far as you can tell)
+    Recv(RecvArgs),
+    /// Live-stream room traffic until Ctrl-C
+    Tail(TailArgs),
+    /// Who is here
+    Who(WhoArgs),
+    /// List rooms
+    Rooms,
+    /// Replay a room from a cursor
+    History(HistoryArgs),
+}
+
+#[derive(Args)]
+struct RegisterArgs {
+    /// agent id, e.g. codex@myrepo (default $AGENT_ID)
+    #[arg(long)]
+    agent: Option<String>,
+    #[arg(long, default_value = "bus-cli")]
+    harness: String,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    caps: Vec<String>,
+    #[arg(long)]
+    session: Option<String>,
+}
+
+#[derive(Args)]
+struct RoomArgs {
+    #[arg(long)]
+    room: String,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct SendArgs {
+    #[arg(long)]
+    room: String,
+    #[arg(long)]
+    kind: String,
+    #[arg(long)]
+    text: Option<String>,
+    /// kind-specific JSON payload
+    #[arg(long)]
+    payload: Option<String>,
+    #[arg(long)]
+    thread: Option<String>,
+    #[arg(long)]
+    reply_to: Option<String>,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct RecvArgs {
+    #[arg(long)]
+    room: Option<String>,
+    /// seconds to block (default 30)
+    #[arg(long, default_value_t = 30)]
+    timeout: u64,
+    #[arg(long, default_value = "text")]
+    format: String,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct TailArgs {
+    /// comma-separated room filter
+    #[arg(long)]
+    rooms: Option<String>,
+    /// comma-separated kind filter
+    #[arg(long, value_delimiter = ',')]
+    kinds: Option<Vec<String>>,
+    #[arg(long, default_value = "text")]
+    format: String,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct WhoArgs {
+    #[arg(long)]
+    room: Option<String>,
+}
+
+#[derive(Args)]
+struct HistoryArgs {
+    #[arg(long)]
+    room: String,
+    /// replay from this seq (exclusive)
+    #[arg(long, default_value_t = 0)]
+    since: i64,
+    #[arg(long, default_value_t = 500)]
+    limit: i64,
+    /// print full envelopes as JSON lines
+    #[arg(long)]
+    full: bool,
+}
+
+fn port(cli_port: Option<u16>) -> u16 {
+    std::env::var("AGENT_BUS_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .or(cli_port)
+        .unwrap_or(47113)
+}
+
+fn default_agent(explicit: Option<String>) -> String {
+    explicit
+        .or_else(|| std::env::var("AGENT_ID").ok())
+        .unwrap_or_else(|| "anonymous@bus".into())
+}
+
+fn bus_home() -> std::path::PathBuf {
+    if let Ok(h) = std::env::var("AGENT_BUS_HOME") {
+        return h.into();
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".agent-bus")
+}
+
+fn token_path(agent: &str) -> std::path::PathBuf {
+    let sanitized: String = agent
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    bus_home().join("tokens").join(format!("{sanitized}.token"))
+}
+
+struct Client {
+    reader: BufReader<OwnedReadHalf>,
+    writer: OwnedWriteHalf,
+}
+
+impl Client {
+    async fn connect(p: u16) -> Result<Client> {
+        let stream = TcpStream::connect(("127.0.0.1", p))
+            .await
+            .context("connect to agent-busd (is it running?)")?;
+        let (rd, wr) = stream.into_split();
+        Ok(Client {
+            reader: BufReader::new(rd),
+            writer: wr,
+        })
+    }
+
+    async fn send_raw(&mut self, v: &Value) -> Result<()> {
+        self.writer.write_all(encode_line(v).as_bytes()).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
+    async fn read_msg(&mut self) -> Result<Value> {
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Err(anyhow!("connection closed by busd"));
+        }
+        decode_line(line.trim_end_matches('\n').as_bytes()).map_err(|e| anyhow!("{e}"))
+    }
+
+    async fn op(&mut self, v: Value) -> Result<Value> {
+        self.send_raw(&v).await?;
+        let reply = self.read_msg().await?;
+        if reply.get("op").and_then(|o| o.as_str()) == Some("error") {
+            let code = reply.get("code").and_then(|c| c.as_str()).unwrap_or("?");
+            let msg = reply.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            return Err(anyhow!("[{code}] {msg}"));
+        }
+        Ok(reply)
+    }
+
+    async fn hello(&mut self, agent: Option<&Agent>, token: Option<&str>) -> Result<Value> {
+        let mut v = json!({"op": "hello", "v": 1});
+        if let Some(a) = agent {
+            v["agent"] = serde_json::to_value(a)?;
+        }
+        if let Some(t) = token {
+            v["token"] = t.into();
+        }
+        self.send_raw(&v).await?;
+        let reply = self.read_msg().await?;
+        match reply.get("op").and_then(|o| o.as_str()) {
+            Some("welcome") => Ok(reply),
+            Some("error") => Err(anyhow!(
+                "[{}] {}",
+                reply.get("code").and_then(|c| c.as_str()).unwrap_or("?"),
+                reply.get("message").and_then(|m| m.as_str()).unwrap_or("")
+            )),
+            other => Err(anyhow!("unexpected handshake reply {other:?}")),
+        }
+    }
+
+    async fn bye(&mut self) {
+        let _ = self.send_raw(&json!({"op": "bye"})).await;
+    }
+}
+
+fn read_token(agent: &str) -> Option<String> {
+    std::fs::read_to_string(token_path(agent)).ok().map(|s| s.trim().to_string())
+}
+
+fn make_agent(
+    id: &str,
+    harness: &str,
+    model: Option<&str>,
+    caps: &[String],
+    session: Option<&str>,
+) -> Agent {
+    Agent {
+        id: id.to_string(),
+        harness: harness.to_string(),
+        model: model.map(String::from),
+        session: session.map(String::from),
+        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        caps: caps.to_vec(),
+    }
+}
+
+fn fmt_env(env: &Value, format: &str) -> String {
+    if format == "json" {
+        return serde_json::to_string(env).unwrap_or_default();
+    }
+    let seq = env.get("seq").and_then(|s| s.as_i64()).unwrap_or(0);
+    let kind = env.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
+    let from = env
+        .get("from")
+        .and_then(|f| f.get("id"))
+        .and_then(|i| i.as_str())
+        .unwrap_or("?");
+    let room = env.get("room").and_then(|r| r.as_str()).unwrap_or("?");
+    let text = env.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    format!("[{seq}] {kind} {from} ({room}): {text}")
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    if let Err(e) = run(cli).await {
+        eprintln!("bus: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    let p = port(cli.port);
+    let mut c = Client::connect(p).await?;
+
+    match cli.cmd {
+        Cmd::Register(a) => {
+            let id = default_agent(a.agent);
+            let agent =
+                make_agent(&id, &a.harness, a.model.as_deref(), &a.caps, a.session.as_deref());
+            let existing = read_token(&id);
+            let mut v = json!({"op": "register", "agent": agent});
+            if let Some(t) = &existing {
+                v["token"] = t.as_str().into();
+            }
+            c.hello(None, None).await?;
+            let reply = c.op(v).await?;
+            c.bye().await;
+            let role = reply.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            if let Some(token) = reply.get("token").and_then(|t| t.as_str()) {
+                let path = token_path(&id);
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&path, token)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                println!("registered {id} role={role} token stored at {}", path.display());
+            } else {
+                println!("registered {id} role={role} (token verified)");
+            }
+        }
+        Cmd::Join(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+            let reply = c.op(json!({"op": "join", "room": a.room})).await?;
+            c.bye().await;
+            println!(
+                "joined {} seq={}",
+                a.room,
+                reply.get("seq").and_then(|s| s.as_i64()).unwrap_or(0)
+            );
+        }
+        Cmd::Leave(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+            c.op(json!({"op": "leave", "room": a.room})).await?;
+            c.bye().await;
+            println!("left {}", a.room);
+        }
+        Cmd::Send(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+            let mut v = json!({"op": "send", "room": a.room, "kind": a.kind});
+            if let Some(t) = &a.text {
+                v["text"] = t.as_str().into();
+            }
+            if let Some(p) = &a.payload {
+                v["payload"] = serde_json::from_str(p).context("payload must be valid JSON")?;
+            }
+            if let Some(t) = &a.thread {
+                v["thread"] = t.as_str().into();
+            }
+            if let Some(r) = &a.reply_to {
+                v["reply_to"] = r.as_str().into();
+            }
+            let reply = c.op(v).await?;
+            c.bye().await;
+            println!(
+                "sent {} seq={}",
+                reply.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
+                reply.get("seq").and_then(|s| s.as_i64()).unwrap_or(0)
+            );
+        }
+        Cmd::Recv(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+            let mut v = json!({"op": "recv", "timeout_ms": a.timeout * 1000});
+            if let Some(r) = &a.room {
+                v["room"] = r.as_str().into();
+            }
+            let reply = c.op(v).await?;
+            c.bye().await;
+            if reply.get("op").and_then(|o| o.as_str()) == Some("timeout") {
+                eprintln!("bus: recv timed out after {}s", a.timeout);
+                std::process::exit(3);
+            }
+            if let Some(env) = reply.get("envelope") {
+                println!("{}", fmt_env(env, &a.format));
+            }
+        }
+        Cmd::Tail(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+            let mut v = json!({"op": "tail"});
+            if let Some(r) = &a.rooms {
+                let list: Vec<String> = r.split(',').map(|s| s.trim().to_string()).collect();
+                v["rooms"] = json!(list);
+            }
+            if let Some(k) = &a.kinds {
+                v["kinds"] = json!(k);
+            }
+            c.send_raw(&v).await?;
+            let ack = c.read_msg().await?;
+            if ack.get("op").and_then(|o| o.as_str()) != Some("tail") {
+                return Err(anyhow!("tail rejected: {ack}"));
+            }
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = c.reader.read_line(&mut line).await?;
+                if n == 0 {
+                    break;
+                }
+                if let Ok(v) = decode_line(line.trim_end_matches('\n').as_bytes()) {
+                    if v.get("op").and_then(|o| o.as_str()) == Some("msg") {
+                        if let Some(env) = v.get("envelope") {
+                            println!("{}", fmt_env(env, &a.format));
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                }
+            }
+        }
+        Cmd::Who(a) => {
+            c.hello(None, None).await?;
+            let mut v = json!({"op": "who"});
+            if let Some(r) = &a.room {
+                v["room"] = r.as_str().into();
+            }
+            let reply = c.op(v).await?;
+            c.bye().await;
+            if let Some(agents) = reply.get("agents").and_then(|a| a.as_array()) {
+                for a in agents {
+                    println!(
+                        "{:<28} {:<12} {:<22} role={}",
+                        a.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
+                        a.get("harness").and_then(|h| h.as_str()).unwrap_or("?"),
+                        a.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
+                        a.get("role").and_then(|r| r.as_str()).unwrap_or("?"),
+                    );
+                }
+                if agents.is_empty() {
+                    println!("(nobody)");
+                }
+            }
+        }
+        Cmd::Rooms => {
+            c.hello(None, None).await?;
+            let reply = c.op(json!({"op": "rooms"})).await?;
+            c.bye().await;
+            if let Some(rooms) = reply.get("rooms").and_then(|r| r.as_array()) {
+                for r in rooms {
+                    println!(
+                        "{:<40} seq={}",
+                        r.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
+                        r.get("seq").and_then(|s| s.as_i64()).unwrap_or(0)
+                    );
+                }
+                if rooms.is_empty() {
+                    println!("(no rooms)");
+                }
+            }
+        }
+        Cmd::History(a) => {
+            c.hello(None, None).await?;
+            let reply = c
+                .op(json!({"op": "history", "room": a.room, "since": a.since, "limit": a.limit}))
+                .await?;
+            c.bye().await;
+            if let Some(msgs) = reply.get("messages").and_then(|m| m.as_array()) {
+                for m in msgs {
+                    if a.full {
+                        println!("{}", serde_json::to_string(m)?);
+                    } else {
+                        println!("{}", fmt_env(m, "text"));
+                    }
+                }
+                if msgs.is_empty() {
+                    println!("(empty from seq {})", a.since);
+                }
+            }
+        }
+    }
+    Ok(())
+}
