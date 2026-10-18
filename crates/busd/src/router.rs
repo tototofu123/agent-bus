@@ -40,7 +40,10 @@ impl Inbox {
         }
         if matches!(class, DropClass::Block) && q.len() >= DURABLE_INBOX_WARN_CAP {
             // rate limits upstream make this pathological; keep the message anyway
-            eprintln!("busd: durable inbox over cap ({}), retaining message", q.len());
+            eprintln!(
+                "busd: durable inbox over cap ({}), retaining message",
+                q.len()
+            );
         }
         q.push_back(env);
         drop(q);
@@ -59,9 +62,10 @@ impl Inbox {
         loop {
             {
                 let mut q = self.q.lock().unwrap();
-                if let Some(pos) = q.iter().position(|e| {
-                    room_filter.map_or(true, |room| e.room == room)
-                }) {
+                if let Some(pos) = q
+                    .iter()
+                    .position(|e| room_filter.is_none_or(|room| e.room == room))
+                {
                     return q.remove(pos);
                 }
             }
@@ -113,6 +117,12 @@ pub struct Router {
     members: std::sync::RwLock<HashMap<String, HashSet<String>>>,
 }
 
+impl Default for Router {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Router {
     pub fn new() -> Router {
         Router {
@@ -131,7 +141,10 @@ impl Router {
         let mut rate = self.rate.lock().unwrap();
         let q = rate.entry(agent.to_string()).or_default();
         let now = Instant::now();
-        while q.front().map_or(false, |t| now.duration_since(*t) > Duration::from_secs(1)) {
+        while q
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1))
+        {
             q.pop_front();
         }
         if q.len() >= RATE_PER_SEC {
@@ -145,10 +158,18 @@ impl Router {
 
     pub fn inbox(&self, agent: &str) -> Arc<Inbox> {
         let mut inboxes = self.inboxes.lock().unwrap();
-        inboxes.entry(agent.to_string()).or_insert_with(|| Arc::new(Inbox::new())).clone()
+        inboxes
+            .entry(agent.to_string())
+            .or_insert_with(|| Arc::new(Inbox::new()))
+            .clone()
     }
 
-    pub async fn recv(&self, agent: &str, room: Option<&str>, timeout: Duration) -> Option<Envelope> {
+    pub async fn recv(
+        &self,
+        agent: &str,
+        room: Option<&str>,
+        timeout: Duration,
+    ) -> Option<Envelope> {
         let inbox = self.inbox(agent);
         inbox.recv(room, timeout).await
     }
@@ -181,9 +202,7 @@ impl Router {
 
     pub fn load_members(&self, room: &str, members: Vec<String>) {
         let mut m = self.members.write().unwrap();
-        m.entry(room.to_string())
-            .or_default()
-            .extend(members.into_iter());
+        m.entry(room.to_string()).or_default().extend(members);
     }
 
     pub fn member_joined(&self, room: &str, agent: &str) {
@@ -257,7 +276,7 @@ pub fn validate_send(
         ));
     }
     if let Err(e) = kind.validate_payload(env.payload.as_ref(), env.reply_to.as_deref()) {
-        return Err(("payload".into(), format!("{e}")));
+        return Err(("payload".into(), e.to_string()));
     }
     Ok(())
 }

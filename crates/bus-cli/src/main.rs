@@ -157,7 +157,13 @@ fn bus_home() -> std::path::PathBuf {
 fn token_path(agent: &str) -> std::path::PathBuf {
     let sanitized: String = agent
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     bus_home().join("tokens").join(format!("{sanitized}.token"))
 }
@@ -232,7 +238,9 @@ impl Client {
 }
 
 fn read_token(agent: &str) -> Option<String> {
-    std::fs::read_to_string(token_path(agent)).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(token_path(agent))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn make_agent(
@@ -247,7 +255,9 @@ fn make_agent(
         harness: harness.to_string(),
         model: model.map(String::from),
         session: session.map(String::from),
-        cwd: std::env::current_dir().ok().map(|p| p.display().to_string()),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string()),
         caps: caps.to_vec(),
     }
 }
@@ -284,8 +294,13 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Register(a) => {
             let id = default_agent(a.agent);
-            let agent =
-                make_agent(&id, &a.harness, a.model.as_deref(), &a.caps, a.session.as_deref());
+            let agent = make_agent(
+                &id,
+                &a.harness,
+                a.model.as_deref(),
+                &a.caps,
+                a.session.as_deref(),
+            );
             let existing = read_token(&id);
             let mut v = json!({"op": "register", "agent": agent});
             if let Some(t) = &existing {
@@ -304,12 +319,12 @@ async fn run(cli: Cli) -> Result<()> {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
                 }
-                println!("registered {id} role={role} token stored at {}", path.display());
+                println!(
+                    "registered {id} role={role} token stored at {}",
+                    path.display()
+                );
             } else {
                 println!("registered {id} role={role} (token verified)");
             }

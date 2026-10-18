@@ -104,7 +104,12 @@ impl Store {
 
     // -- agents -----------------------------------------------------------
 
-    pub fn upsert_agent(&self, a: &Agent, role: proto::Role, token_hash: Option<&str>) -> Result<()> {
+    pub fn upsert_agent(
+        &self,
+        a: &Agent,
+        role: proto::Role,
+        token_hash: Option<&str>,
+    ) -> Result<()> {
         let now = now_ms();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -130,14 +135,19 @@ impl Store {
 
     pub fn touch_agent(&self, id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE agents SET last_seen=?1 WHERE id=?2", params![now_ms(), id])?;
+        conn.execute(
+            "UPDATE agents SET last_seen=?1 WHERE id=?2",
+            params![now_ms(), id],
+        )?;
         Ok(())
     }
 
     pub fn agent_role(&self, id: &str) -> Result<Option<proto::Role>> {
         let conn = self.conn.lock().unwrap();
         let role: Option<String> = conn
-            .query_row("SELECT role FROM agents WHERE id=?1", params![id], |r| r.get(0))
+            .query_row("SELECT role FROM agents WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -149,7 +159,11 @@ impl Store {
     pub fn token_hash(&self, id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let h: Option<String> = conn
-            .query_row("SELECT token_hash FROM agents WHERE id=?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT token_hash FROM agents WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
             .map(Some)
             .or_else(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => Ok(None),
@@ -166,7 +180,10 @@ impl Store {
                 if h.len() != got.len() {
                     return false;
                 }
-                h.bytes().zip(got.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+                h.bytes()
+                    .zip(got.bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
             }
             _ => false,
         }
@@ -175,8 +192,10 @@ impl Store {
     pub fn who(&self, room: Option<&str>) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let sql = match room {
-            Some(room) => "SELECT a.id, a.harness, a.model, a.last_seen, a.role FROM agents a
-                           JOIN members m ON m.agent = a.id WHERE m.room = ?1 ORDER BY a.id",
+            Some(_) => {
+                "SELECT a.id, a.harness, a.model, a.last_seen, a.role FROM agents a
+                           JOIN members m ON m.agent = a.id WHERE m.room = ?1 ORDER BY a.id"
+            }
             None => "SELECT id, harness, model, last_seen, role FROM agents ORDER BY id",
         };
         let mut stmt = conn.prepare(sql)?;
@@ -205,7 +224,11 @@ impl Store {
 
     pub fn room_seq(&self, name: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        Ok(conn.query_row("SELECT seq FROM rooms WHERE name=?1", params![name], |r| r.get(0))?)
+        Ok(
+            conn.query_row("SELECT seq FROM rooms WHERE name=?1", params![name], |r| {
+                r.get(0)
+            })?,
+        )
     }
 
     pub fn rooms(&self) -> Result<Vec<serde_json::Value>> {
@@ -234,7 +257,10 @@ impl Store {
 
     pub fn leave(&self, agent: &str, room: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM members WHERE agent=?1 AND room=?2", params![agent, room])?;
+        conn.execute(
+            "DELETE FROM members WHERE agent=?1 AND room=?2",
+            params![agent, room],
+        )?;
         Ok(())
     }
 

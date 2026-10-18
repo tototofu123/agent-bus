@@ -89,13 +89,6 @@ impl Client {
         assert_eq!(welcome["op"], "welcome");
         self.op(json!({"op": "register", "agent": agent})).await
     }
-
-    async fn join(&mut self, room: &str) -> Result<Value> {
-        // re-hello with identity + token from register
-        self.send(&json!({"op": "hello", "v": 1})).await?;
-        let _ = self.read().await;
-        self.op(json!({"op": "join", "room": room})).await
-    }
 }
 
 fn agent_hello(id: &str, model: Option<&str>, token: Option<&str>) -> Value {
@@ -115,16 +108,26 @@ async fn two_agents_one_room_full_flow() -> Result<()> {
 
     // -- codex registers (peer-class model) and joins
     let mut codex = Client::connect(server.port).await?;
-    let reg = codex.register("codex@demo", "codex-cli", Some("gpt-5-codex")).await?;
+    let reg = codex
+        .register("codex@demo", "codex-cli", Some("gpt-5-codex"))
+        .await?;
     assert_eq!(reg["op"], "registered");
     assert_eq!(reg["role"], "peer");
     let codex_token = reg["token"].as_str().expect("token issued").to_string();
 
     let mut codex = Client::connect(server.port).await?;
-    codex.send(&agent_hello("codex@demo", Some("gpt-5-codex"), Some(&codex_token))).await?;
+    codex
+        .send(&agent_hello(
+            "codex@demo",
+            Some("gpt-5-codex"),
+            Some(&codex_token),
+        ))
+        .await?;
     let w = codex.read().await?;
     assert_eq!(w["op"], "welcome");
-    codex.op(json!({"op": "join", "room": "#task:fix-auth"})).await?;
+    codex
+        .op(json!({"op": "join", "room": "#task:fix-auth"}))
+        .await?;
 
     // -- claude registers (unknown model -> protocol role) and joins
     let mut claude = Client::connect(server.port).await?;
@@ -133,9 +136,13 @@ async fn two_agents_one_room_full_flow() -> Result<()> {
     let claude_token = reg["token"].as_str().unwrap().to_string();
 
     let mut claude = Client::connect(server.port).await?;
-    claude.send(&agent_hello("claude@demo", None, Some(&claude_token))).await?;
+    claude
+        .send(&agent_hello("claude@demo", None, Some(&claude_token)))
+        .await?;
     let _ = claude.read().await;
-    claude.op(json!({"op": "join", "room": "#task:fix-auth"})).await?;
+    claude
+        .op(json!({"op": "join", "room": "#task:fix-auth"}))
+        .await?;
 
     // -- t+2: codex offers the task (durable kind)
     let sent = codex
@@ -161,8 +168,10 @@ async fn two_agents_one_room_full_flow() -> Result<()> {
 
     // -- protocol-role agent may not claim (typed, public deny)
     let err = claude
-        .op(json!({"op": "send", "room": "#task:fix-auth", "kind": "task.claim",
-                    "payload": {"files": ["src/auth/login.ts"]}}))
+        .op(
+            json!({"op": "send", "room": "#task:fix-auth", "kind": "task.claim",
+                    "payload": {"files": ["src/auth/login.ts"]}}),
+        )
         .await;
     assert!(err.is_err(), "protocol role must not claim");
 
@@ -185,31 +194,43 @@ async fn two_agents_one_room_full_flow() -> Result<()> {
 
     // -- answer requires reply_to: missing -> typed payload error
     let bad = codex
-        .send_and_read_error(json!({"op": "send", "room": "#task:fix-auth", "kind": "answer", "text": "yes"}))
+        .send_and_read_error(
+            json!({"op": "send", "room": "#task:fix-auth", "kind": "answer", "text": "yes"}),
+        )
         .await?;
     assert_eq!(bad["code"], "payload");
 
     // -- good answer
     codex
-        .op(json!({"op": "send", "room": "#task:fix-auth", "kind": "answer",
-                    "text": "yes, tests/ only", "reply_to": offer_id}))
+        .op(
+            json!({"op": "send", "room": "#task:fix-auth", "kind": "answer",
+                    "text": "yes, tests/ only", "reply_to": offer_id}),
+        )
         .await?;
 
     // -- history: exact ordered thread
     let mut hist = Client::connect(server.port).await?;
     hist.send(&json!({"op": "hello", "v": 1})).await?;
     let _ = hist.read().await;
-    let h = hist.op(json!({"op": "history", "room": "#task:fix-auth"})).await?;
+    let h = hist
+        .op(json!({"op": "history", "room": "#task:fix-auth"}))
+        .await?;
     let msgs = h["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 3);
     let seqs: Vec<i64> = msgs.iter().map(|m| m["seq"].as_i64().unwrap()).collect();
-    assert_eq!(seqs, vec![1, 2, 3], "server-assigned seq must be 1..n with no gaps");
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3],
+        "server-assigned seq must be 1..n with no gaps"
+    );
     assert_eq!(msgs[0]["kind"], "task.offer");
     assert_eq!(msgs[1]["kind"], "question");
     assert_eq!(msgs[2]["kind"], "answer");
 
     // -- who: both present
-    let who = hist.op(json!({"op": "who", "room": "#task:fix-auth"})).await?;
+    let who = hist
+        .op(json!({"op": "who", "room": "#task:fix-auth"}))
+        .await?;
     assert_eq!(who["count"].as_i64().unwrap(), 2);
 
     // -- rooms
@@ -221,7 +242,9 @@ async fn two_agents_one_room_full_flow() -> Result<()> {
     assert_eq!(t["op"], "timeout");
 
     // -- leave: claude stops receiving
-    claude.op(json!({"op": "leave", "room": "#task:fix-auth"})).await?;
+    claude
+        .op(json!({"op": "leave", "room": "#task:fix-auth"}))
+        .await?;
     codex
         .op(json!({"op": "send", "room": "#task:fix-auth", "kind": "chat", "text": "ping"}))
         .await?;
@@ -275,22 +298,28 @@ async fn handshake_and_auth_rules() -> Result<()> {
 
     // hello with wrong token -> auth error, connection refused
     let mut c3 = Client::connect(server.port).await?;
-    c3.send(&agent_hello("a@x", Some("llama-3-70b"), Some("wrong"))).await?;
+    c3.send(&agent_hello("a@x", Some("llama-3-70b"), Some("wrong")))
+        .await?;
     let err = c3.read().await?;
     assert_eq!(err["op"], "error");
     assert_eq!(err["code"], "auth");
 
     // hello with right token works, welcome carries cursor after join
     let mut c4 = Client::connect(server.port).await?;
-    c4.send(&agent_hello("a@x", Some("llama-3-70b"), Some(&token))).await?;
+    c4.send(&agent_hello("a@x", Some("llama-3-70b"), Some(&token)))
+        .await?;
     let w = c4.read().await?;
     assert_eq!(w["op"], "welcome");
     c4.op(json!({"op": "join", "room": "#repo:x"})).await?;
     let mut c5 = Client::connect(server.port).await?;
-    c5.send(&agent_hello("a@x", Some("llama-3-70b"), Some(&token))).await?;
+    c5.send(&agent_hello("a@x", Some("llama-3-70b"), Some(&token)))
+        .await?;
     let w = c5.read().await?;
     let cursor = w["cursor"].as_object().unwrap();
-    assert!(cursor.contains_key("#repo:x"), "welcome cursor must include joined rooms");
+    assert!(
+        cursor.contains_key("#repo:x"),
+        "welcome cursor must include joined rooms"
+    );
     assert_eq!(cursor["#repo:x"].as_i64().unwrap(), 0);
     Ok(())
 }
@@ -304,13 +333,15 @@ async fn rate_limit_trips_at_60_per_s() -> Result<()> {
     let token = reg["token"].as_str().unwrap().to_string();
 
     let mut c = Client::connect(server.port).await?;
-    c.send(&agent_hello("flood@demo", None, Some(&token))).await?;
+    c.send(&agent_hello("flood@demo", None, Some(&token)))
+        .await?;
     let _ = c.read().await;
     c.op(json!({"op": "join", "room": "#flood"})).await?;
 
     let mut denied = 0;
     for i in 0..80 {
-        c.send(&json!({"op": "send", "room": "#flood", "kind": "chat", "text": i})).await?;
+        c.send(&json!({"op": "send", "room": "#flood", "kind": "chat", "text": i}))
+            .await?;
         let r = c.read().await?;
         if r["op"] == "error" && r["code"] == "rate" {
             denied += 1;
@@ -324,21 +355,30 @@ async fn rate_limit_trips_at_60_per_s() -> Result<()> {
 async fn tail_streams_live_traffic() -> Result<()> {
     let server = start_server().await?;
     let mut c = Client::connect(server.port).await?;
-    let reg = c.register("sender@demo", "test", Some("llama-3-70b")).await?;
+    let reg = c
+        .register("sender@demo", "test", Some("llama-3-70b"))
+        .await?;
     let token = reg["token"].as_str().unwrap().to_string();
 
     // a tail observer (anonymous is fine — tail only reads)
     let mut tail = Client::connect(server.port).await?;
     tail.send(&json!({"op": "hello", "v": 1})).await?;
     let _ = tail.read().await;
-    tail.send(&json!({"op": "tail", "rooms": ["#live"], "kinds": ["chat"]})).await?;
+    tail.send(&json!({"op": "tail", "rooms": ["#live"], "kinds": ["chat"]}))
+        .await?;
     let ack = tail.read().await?;
     assert_eq!(ack["op"], "tail");
 
     let mut c = Client::connect(server.port).await?;
-    c.send(&agent_hello("sender@demo", Some("llama-3-70b"), Some(&token))).await?;
+    c.send(&agent_hello(
+        "sender@demo",
+        Some("llama-3-70b"),
+        Some(&token),
+    ))
+    .await?;
     let _ = c.read().await;
-    c.send(&json!({"op": "send", "room": "#live", "kind": "chat", "text": "hello tail"})).await?;
+    c.send(&json!({"op": "send", "room": "#live", "kind": "chat", "text": "hello tail"}))
+        .await?;
     let sent = c.read().await?;
     assert_eq!(sent["op"], "sent");
 
@@ -363,7 +403,8 @@ async fn ordering_many_senders_no_gaps() -> Result<()> {
     }
     for (id, token) in &tokens {
         let mut c = Client::connect(server.port).await?;
-        c.send(&agent_hello(id, Some("llama-3-70b"), Some(token))).await?;
+        c.send(&agent_hello(id, Some("llama-3-70b"), Some(token)))
+            .await?;
         let _ = c.read().await;
         c.op(json!({"op": "join", "room": room})).await?;
     }
@@ -376,7 +417,8 @@ async fn ordering_many_senders_no_gaps() -> Result<()> {
         let token = token.clone();
         handles.push(tokio::spawn(async move {
             let mut c = Client::connect(port).await?;
-            c.send(&agent_hello(&id, Some("llama-3-70b"), Some(&token))).await?;
+            c.send(&agent_hello(&id, Some("llama-3-70b"), Some(&token)))
+                .await?;
             let _ = c.read().await;
             for j in 0..25 {
                 let v = json!({"op": "send", "room": "#storm", "kind": "status",
@@ -404,7 +446,12 @@ async fn ordering_many_senders_no_gaps() -> Result<()> {
     let msgs = h["messages"].as_array().unwrap();
     assert_eq!(msgs.len(), 200);
     for (i, m) in msgs.iter().enumerate() {
-        assert_eq!(m["seq"].as_i64().unwrap(), (i + 1) as i64, "gap at {}", i + 1);
+        assert_eq!(
+            m["seq"].as_i64().unwrap(),
+            (i + 1) as i64,
+            "gap at {}",
+            i + 1
+        );
     }
     Ok(())
 }

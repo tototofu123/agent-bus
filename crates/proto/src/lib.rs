@@ -52,7 +52,10 @@ fn params_b(model: &str) -> Option<f64> {
     for i in (0..bytes.len()).rev() {
         if bytes[i] == b'-' || bytes[i] == b'_' || bytes[i] == b'/' || bytes[i] == b':' {
             let tail = &m[i + 1..];
-            let num: String = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            let num: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
             let unit = &tail[num.len()..];
             if let Ok(n) = num.parse::<f64>() {
                 if unit.starts_with('b') {
@@ -71,7 +74,10 @@ fn params_b(model: &str) -> Option<f64> {
         while start > 0 && (b[start - 1].is_ascii_digit() || b[start - 1] == b'.') {
             start -= 1;
         }
-        let num: String = m[start..=pos].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let num: String = m[start..=pos]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
         if pos + 1 < m.len() && (m.as_bytes()[pos + 1] == b'b') {
             if let Ok(n) = num.parse::<f64>() {
                 return Some(n);
@@ -124,13 +130,18 @@ impl Role {
     /// owning a migration.
     pub fn assign(agent: &Agent) -> Role {
         let harness = agent.harness.to_ascii_lowercase();
-        let script = harness.contains("script") || harness.contains("sh") || harness.contains("curl");
+        let script =
+            harness.contains("script") || harness.contains("sh") || harness.contains("curl");
         match (agent.model.as_deref(), script) {
             (None, true) | (Some(""), true) | (Some("none"), true) => Role::Transport,
             (None, _) => Role::Protocol,
             (Some(m), _) => {
                 if m.is_empty() || m == "none" {
-                    return if script { Role::Transport } else { Role::Protocol };
+                    return if script {
+                        Role::Transport
+                    } else {
+                        Role::Protocol
+                    };
                 }
                 match params_b(m) {
                     Some(b) if b >= 30.0 => Role::Peer,
@@ -254,7 +265,11 @@ impl Kind {
     }
 
     /// Minimal payload validation (payload contracts in docs/protocol.md).
-    pub fn validate_payload(self, payload: Option<&Value>, reply_to: Option<&str>) -> Result<(), String> {
+    pub fn validate_payload(
+        self,
+        payload: Option<&Value>,
+        reply_to: Option<&str>,
+    ) -> Result<(), String> {
         use Kind::*;
         match self {
             Chat => Ok(()),
@@ -290,7 +305,9 @@ impl Kind {
                 let p = payload.ok_or("policy requires payload")?;
                 if p.get("allow").and_then(|v| v.as_array()).is_none()
                     && p.get("deny").and_then(|v| v.as_array()).is_none()
-                    && p.get("requires_approval").and_then(|v| v.as_array()).is_none()
+                    && p.get("requires_approval")
+                        .and_then(|v| v.as_array())
+                        .is_none()
                 {
                     return Err("policy payload needs allow/deny/requires_approval".into());
                 }
@@ -510,7 +527,10 @@ mod tests {
 
     #[test]
     fn framing_rejects_garbage() {
-        assert!(matches!(decode_line(b"{not json"), Err(FrameError::NotJson(_))));
+        assert!(matches!(
+            decode_line(b"{not json"),
+            Err(FrameError::NotJson(_))
+        ));
         assert!(matches!(decode_line(b""), Err(FrameError::Empty)));
     }
 
@@ -537,16 +557,28 @@ mod tests {
         };
         assert_eq!(Role::assign(&script), Role::Transport);
 
-        let small = Agent { model: Some("qwen3-0.6b".into()), ..script.clone() };
+        let small = Agent {
+            model: Some("qwen3-0.6b".into()),
+            ..script.clone()
+        };
         assert_eq!(Role::assign(&small), Role::Protocol);
 
-        let mid = Agent { model: Some("qwen2.5-coder-7b".into()), ..script.clone() };
+        let mid = Agent {
+            model: Some("qwen2.5-coder-7b".into()),
+            ..script.clone()
+        };
         assert_eq!(Role::assign(&mid), Role::Conversation);
 
-        let frontier = Agent { model: Some("claude-sonnet".into()), ..script.clone() };
+        let frontier = Agent {
+            model: Some("claude-sonnet".into()),
+            ..script.clone()
+        };
         assert_eq!(Role::assign(&frontier), Role::Protocol); // unknown size -> weakest
 
-        let big = Agent { model: Some("llama-3-70b".into()), ..script.clone() };
+        let big = Agent {
+            model: Some("llama-3-70b".into()),
+            ..script.clone()
+        };
         assert_eq!(Role::assign(&big), Role::Peer);
     }
 
@@ -566,7 +598,9 @@ mod tests {
         assert!(Kind::TaskOffer.validate_payload(Some(&files), None).is_ok());
 
         let no_files = serde_json::json!({"claim_ttl_s": 300});
-        assert!(Kind::TaskOffer.validate_payload(Some(&no_files), None).is_err());
+        assert!(Kind::TaskOffer
+            .validate_payload(Some(&no_files), None)
+            .is_err());
         assert!(Kind::TaskClaim.validate_payload(None, None).is_err());
 
         assert!(Kind::Answer.validate_payload(None, None).is_err());
@@ -574,7 +608,9 @@ mod tests {
 
         let pol = serde_json::json!({"deny": ["src/db/**"]});
         assert!(Kind::Policy.validate_payload(Some(&pol), None).is_ok());
-        assert!(Kind::Policy.validate_payload(Some(&serde_json::json!({})), None).is_err());
+        assert!(Kind::Policy
+            .validate_payload(Some(&serde_json::json!({})), None)
+            .is_err());
     }
 
     #[test]
