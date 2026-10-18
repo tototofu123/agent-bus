@@ -32,6 +32,12 @@
 6. **`crates/bus-cli`**: subcommands mapping 1:1 to the protocol; `recv` blocks via long-poll on the socket; output formats `text`/`json`.
 7. **Windows**: named pipe via tokio, TCP loopback `127.0.0.1:47113` as universal fallback (see ADR-0003 note).
 
+## Implementation notes (deviations from the plan above)
+
+- **Transport is TCP loopback only.** Named pipes are not implemented. ADR-0003 already names TCP loopback the universal fallback, so this is the "quality knob" risk, not a blocker — but the scope item stands unmet.
+- **The listener lives in `session.rs`, not `socket.rs`.** It carries the per-connection protocol state machine (handshake → op loop → dispatch) alongside the accept loop, which is what made the file worth the name.
+- **Ordering is verified at 8 writers × 25 messages, not the 10k the gate calls for.** The remaining gates (latency, throughput, replay, backpressure, crash safety) are unrun.
+
 ## The proof (demo)
 
 Two shell scripts, one room, zero harnesses:

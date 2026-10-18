@@ -24,17 +24,43 @@ Every agentic harness today is an island. Claude Code, Codex CLI, Gemini CLI, op
 
 ## Status
 
-Docs-first build. The protocol, architecture, and phased plan are locked; code lands phase by phase.
+The Phase 1 core is built and tested: the daemon, the store, the sequencer, the role floors, and the CLI all work end to end. What is not done is the evidence — the exit criteria are load and chaos gates (latency, throughput, crash safety, replay, backpressure) that have not been run yet, so Phase 1 is not finished.
 
 | Phase | Delivers | Status |
 |---|---|---|
-| [1 — Broker + CLI + rooms](docs/phases/phase-1-broker-cli-rooms.md) | `agent-busd`, SQLite, socket transport, `bus send/recv/tail/who/history` | 🔜 next |
+| [1 — Broker + CLI + rooms](docs/phases/phase-1-broker-cli-rooms.md) | `agent-busd`, SQLite, TCP loopback transport, `bus send/recv/tail/who/history` | in progress — core done, perf/chaos gates outstanding |
 | [2 — Local IP surface + presence](docs/phases/phase-2-localip-presence.md) | localhost WS + REST, auto-join hooks, mentions, threads | planned |
 | [3 — Claims, handoff, artifacts](docs/phases/phase-3-claims-handoff-artifacts.md) | file-lock registry, `task.*`, artifact store, context compaction | planned |
 | [4 — MCP face + human surfaces + policy](docs/phases/phase-4-mcp-human-policy.md) | `bus-mcp` (stdio + Streamable HTTP), TUI, web, approval gates | planned |
 | [5 — LAN & federation](docs/phases/phase-5-lan-federation.md) | mDNS + mTLS, cross-machine rooms, CI participants | planned |
 
 See [ROADMAP.md](ROADMAP.md) for the one-page view and how to reach each phase.
+
+## Quick start
+
+```bash
+cargo build --release
+
+# Terminal 1 — the broker
+./target/release/busd --port 47113 --db ./busd.sqlite
+
+# Terminal 2 — an agent registers, joins, and talks
+export AGENT_ID=codex@demo
+bus register --agent "$AGENT_ID" --harness codex-cli --model gpt-5-codex
+bus join    --room '#task:demo'
+bus send    --room '#task:demo' --kind chat --text 'auth redirect broken on POST /login'
+
+# Terminal 3 — another agent receives it (blocking = push, as far as the agent can tell)
+export AGENT_ID=claude@demo
+bus register --agent "$AGENT_ID" --harness claude-code --model claude-sonnet-4-5
+bus join    --room '#task:demo'
+bus recv    --room '#task:demo' --timeout 30
+bus history --room '#task:demo'
+```
+
+Tokens are written to `$AGENT_BUS_HOME/tokens/<agent>.token` (default `~/.agent-bus`), so a later `bus` command re-identifies without re-registering. With no `--agent` and no `$AGENT_ID`, the client connects as `anonymous@bus`: it can read (`who`, `rooms`, `history`) but has no membership, so it receives nothing.
+
+`cargo test` runs 16 tests — 5 end-to-end broker tests and 11 protocol unit tests.
 
 ## The six primitives
 
@@ -64,6 +90,10 @@ Everything is built from these:
 agent-bus/
 ├── README.md               ← you are here
 ├── ROADMAP.md              ← phases at a glance, how to reach each
+├── crates/
+│   ├── proto/              ← envelope, kinds, NDJSON framing, role floors, tokens
+│   ├── busd/               ← the broker: session state machine, router, SQLite store
+│   └── bus-cli/            ← `bus`: one-shot commands over TCP loopback NDJSON
 ├── docs/
 │   ├── protocol.md         ← NDJSON wire protocol, envelope, kind contracts
 │   ├── architecture.md     ← components, data flow, storage

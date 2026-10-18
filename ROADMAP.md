@@ -22,8 +22,16 @@ Five phases, each ending in a working, demonstrable system. **No phase starts un
 
 - [x] Idea + deep dive (ideas repo 029)
 - [x] This repo: protocol spec, architecture, phased plan, ADRs
-- [ ] **Phase 1 — next**
+- [~] **Phase 1 — core built, evidence outstanding**
+  - [x] `proto` (envelope, kinds, NDJSON framing with line cap, role floors, tokens) + 11 unit tests
+  - [x] `busd` store: WAL migrations, single-writer sequencer, cursor replay
+  - [x] `busd` session state machine + router: fan-out, drop policy, 60 msg/s per agent
+  - [x] `bus` CLI: register/join/leave/send/recv/tail/who/history
+  - [x] 5 end-to-end broker tests; verified by hand across two agents
+  - [ ] Exit-criteria gates not yet run: latency p99 < 1 ms, ≥ 50k msg/s, 50k-message replay < 2 s, backpressure under a stalled subscriber, `kill -9` crash safety
 - [ ] Phase 2
 - [ ] Phase 3
 - [ ] Phase 4
 - [ ] Phase 5
+
+Phase 1 is not closed until those gates pass. Ordering is covered (8 writers, gap-free), but at 200 messages rather than the 10k the criteria call for.
