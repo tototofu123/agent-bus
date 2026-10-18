@@ -1,7 +1,8 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is deliberately NOT ignored: busd and bus ship as binaries, so the
+# resolved dependency graph is part of the build and has to be reproducible.
 
 # runtime artifacts (local bus state — never commit)
 *.sqlite
