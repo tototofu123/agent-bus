@@ -473,37 +473,46 @@ async fn run(cli: Cli) -> Result<()> {
             let mut ticker = tokio::time::interval(std::time::Duration::from_millis(400));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+            let mut last_size: Option<(usize, usize)> = None;
 
             loop {
                 tokio::select! {
-                    _ = ticker.tick() => {
-                        let (w, h) = watch::terminal_size();
-                        let lanes: [watch::Lane; 3] = feed.lock().map(|f| {
-                                [
-                                    watch::Lane {
-                                        title: format!("MAIN   {id}"),
-                                        rows: f.mine.clone(),
-                                    },
-                                    watch::Lane {
-                                        title: "SUBAGENTS   other bus members".into(),
-                                        rows: f.theirs.clone(),
-                                    },
-                                    watch::Lane {
-                                        title: "REPORT   reserved".into(),
-                                        rows: vec!["- not implemented yet -".into()],
-                                    },
-                                ]
-                            }).unwrap_or_else(|_| [
-                                watch::Lane { title: String::new(), rows: vec![] },
-                                watch::Lane { title: String::new(), rows: vec![] },
-                                watch::Lane { title: String::new(), rows: vec![] },
-                            ]);
-                        // Home the cursor, then redraw in place.
-                        print!("\x1b[H\x1b[2J{}", watch::render(w, h, &lanes));
-                        let _ = std::io::stdout().flush();
-                    }
-                    _ = &mut ctrl_c => break,
+                                    _ = ticker.tick() => {
+                                        let (w, h) = watch::terminal_size();
+                                        let lanes: [watch::Lane; 3] = feed.lock().map(|f| {
+                                                [
+                                                    watch::Lane {
+                                                        title: format!("MAIN   {id}"),
+                                                        rows: f.mine.clone(),
+                                                    },
+                                                    watch::Lane {
+                                                        title: "SUBAGENTS   other bus members".into(),
+                                                        rows: f.theirs.clone(),
+                                                    },
+                                                    watch::Lane {
+                                                        title: "REPORT   reserved".into(),
+                                                        rows: vec!["- not implemented yet -".into()],
+                                                    },
+                                                ]
+                                            }).unwrap_or_else(|_| [
+                                                watch::Lane { title: String::new(), rows: vec![] },
+                                                watch::Lane { title: String::new(), rows: vec![] },
+                                                watch::Lane { title: String::new(), rows: vec![] },
+                                            ]);
+                                        // Home the cursor, then redraw in place.
+                                        // Overwrite rather than clear-and-redraw: every cell of every row is
+                // rewritten each frame, so clearing is unnecessary and makes the pane
+                // visibly flicker at the repaint rate. Clear only when the size changes,
+                // so a resize cannot leave stale cells behind.
+                if last_size != Some((w, h)) {
+                    print!("\x1b[2J");
+                    last_size = Some((w, h));
                 }
+                print!("\x1b[H{}", watch::render(w, h, &lanes));
+                                        let _ = std::io::stdout().flush();
+                                    }
+                                    _ = &mut ctrl_c => break,
+                                }
             }
 
             reader_task.abort();
