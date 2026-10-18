@@ -271,6 +271,13 @@ impl Store {
         } else {
             Some(now_ms() + EPHEMERAL_TTL_MS)
         };
+        // Stamp before serialising. `env_json` is the durable record that
+        // `history` replays, so anything set after the INSERT is missing from
+        // the replay and reads back as null.
+        env.seq = Some(seq);
+        if env.trust.is_none() {
+            env.trust = Some(Trust::Peer);
+        }
         tx.execute(
             "INSERT INTO messages (id, room, seq, ts_ms, kind, sender, expires, env_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -286,10 +293,6 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        env.seq = Some(seq);
-        if env.trust.is_none() {
-            env.trust = Some(Trust::Peer);
-        }
         Ok(seq)
     }
 

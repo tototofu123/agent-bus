@@ -47,6 +47,11 @@ impl Inbox {
         self.notify.notify_one();
     }
 
+    /// Discard everything queued for `room`.
+    fn drop_room(&self, room: &str) {
+        self.q.lock().unwrap().retain(|e| e.room != room);
+    }
+
     /// Pop the next message matching `room_filter`, waiting up to `timeout`.
     /// Non-matching messages stay in the queue.
     async fn recv(&self, room_filter: Option<&str>, timeout: Duration) -> Option<Envelope> {
@@ -60,11 +65,16 @@ impl Inbox {
                     return q.remove(pos);
                 }
             }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
+            /* Bound the wait by the deadline. Awaiting `notified()` bare can
+             * block forever: a permit stored by an earlier push is consumed by
+             * one iteration, and if nothing arrives after that the await never
+             * returns, so the caller's timeout is silently ignored. */
+            if tokio::time::timeout_at(deadline, self.notify.notified())
+                .await
+                .is_err()
+            {
                 return None;
             }
-            let _ = self.notify.notified().await;
         }
     }
 }
@@ -188,6 +198,10 @@ impl Router {
     pub fn member_left(&self, room: &str, agent: &str) {
         if let Some(set) = self.members.write().unwrap().get_mut(room) {
             set.remove(agent);
+        }
+        /* Leaving means "done with this room", so undelivered messages addressed to it are dropped rather than resurfacing on a later join. Nothing is lost: the inbox is only a delivery queue, and `history` replays the durable record. */
+        if let Some(inbox) = self.inboxes.lock().unwrap().get(agent) {
+            inbox.drop_room(room);
         }
     }
 

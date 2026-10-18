@@ -14,9 +14,14 @@ struct Server {
 }
 
 async fn start_server() -> Result<Server> {
+    // The clock alone is not enough: `SystemTime::now()` quantises to ~100ns on
+    // Windows, so two tests racing in parallel can land in the same tick and
+    // share one database file. The counter makes the name unique per call.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let db = std::env::temp_dir().join(format!(
-        "agent-bus-test-{}-{}.sqlite",
+        "agent-bus-test-{}-{}-{}.sqlite",
         std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

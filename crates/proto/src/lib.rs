@@ -81,6 +81,43 @@ fn params_b(model: &str) -> Option<f64> {
     None
 }
 
+/// Frontier models that publish no parameter count, so `params_b` cannot place
+/// them, and whose name alone already pins a specific release.
+const FRONTIER_EXACT: &[&str] = &[
+    "gpt-5",
+    "gpt-4.1",
+    "gpt-4o",
+    "o1",
+    "o3",
+    "o4",
+    "gemini-1.5-pro",
+    "gemini-2",
+];
+
+/// Frontier families whose bare alias carries no version. These only earn
+/// `peer` once the name pins a release ("claude-sonnet-4-5"), so "claude-sonnet"
+/// still floors at `protocol`.
+const FRONTIER_FAMILY: &[&str] = &["claude-opus", "claude-sonnet", "grok"];
+
+/// Closed models publish no parameter count, so the numeric floors cannot place
+/// them. They are recognised by name rather than guessed at: anything
+/// unrecognised, or named only by an unversioned family alias, still floors at
+/// `protocol`, because guessing upward is how a mislabelled 1B ends up owning
+/// a migration.
+fn is_named_frontier(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if FRONTIER_EXACT.iter().any(|p| m.starts_with(p)) {
+        return true;
+    }
+    FRONTIER_FAMILY.iter().any(|p| {
+        m.starts_with(p)
+            && m[p.len()..]
+                .strip_prefix('-')
+                .unwrap_or(&m[p.len()..])
+                .starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
 impl Role {
     /// Assigned at registration. Unknown model size defaults to the weakest
     /// non-transport role: guessing upward is how a mislabelled 1B ends up
@@ -99,6 +136,7 @@ impl Role {
                     Some(b) if b >= 30.0 => Role::Peer,
                     Some(b) if b >= 7.0 => Role::Conversation,
                     Some(_) => Role::Protocol,
+                    None if is_named_frontier(m) => Role::Peer,
                     None => Role::Protocol,
                 }
             }
@@ -109,12 +147,16 @@ impl Role {
     pub fn allowed(self, kind: &Kind) -> bool {
         use Kind::*;
         match kind {
-            Chat | Status | Artifact | Question | Answer | Presence => true,
+            // A transport is a relay: it forwards text and files, and is not
+            // trusted to summarise, decide, or ask on anyone's behalf.
+            Chat | Artifact => true,
+            Status => !matches!(self, Role::Transport),
+            Question | Answer => !matches!(self, Role::Transport),
             TaskOffer | TaskClaim | TaskHandoff | TaskResult => {
                 matches!(self, Role::Conversation | Role::Peer)
             }
-            // task.grant/task.deny are broker-emitted; policy is trust=human only.
-            TaskGrant | TaskDeny | Policy => false,
+            // Broker-emitted (presence, task.grant/deny) or human-only (policy).
+            Presence | TaskGrant | TaskDeny | Policy => false,
         }
     }
 }
@@ -521,10 +563,10 @@ mod tests {
     #[test]
     fn kind_payload_contracts() {
         let files = serde_json::json!({"files": ["src/**"]});
-        assert!(Kind::validate_payload(Some(&files), None).is_ok());
+        assert!(Kind::TaskOffer.validate_payload(Some(&files), None).is_ok());
 
         let no_files = serde_json::json!({"claim_ttl_s": 300});
-        assert!(Kind::validate_payload(Some(&no_files), None).is_err());
+        assert!(Kind::TaskOffer.validate_payload(Some(&no_files), None).is_err());
         assert!(Kind::TaskClaim.validate_payload(None, None).is_err());
 
         assert!(Kind::Answer.validate_payload(None, None).is_err());
