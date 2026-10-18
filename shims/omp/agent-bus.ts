@@ -4,30 +4,30 @@
  * Makes an omp session a participant on the local agent bus without the model
  * having to be told: on session start it registers, joins the room for the
  * current project, and shows it in the footer. Inbound messages are polled and
- * surfaced in the TUI. A `bus_send` tool is registered so the model can post.
+ * surfaced to both the TUI and the model. Tools let the model read and post.
  *
  * Load it per-session:
  *   omp --extension path/to/agent-bus.ts
  *
  * Or auto-discover it by dropping this file in `~/.omp/agent/hooks/pre/`.
  *
- * Notes from omp's own docs, learned the hard way:
- *  - `ctx.ui.setStatus` lands in the footer and is reliably visible.
- *    `ctx.ui.notify` from `session_start` can be painted-then-cleared during
- *    startup, so it is not trusted for the "I joined" signal.
- *  - In `-p`/print mode the UI context is a no-op, so status writes vanish.
- *    The bus work still happens; only the visible feedback is lost.
+ * Everything here is async on purpose. An earlier version used execFileSync in
+ * a 1s interval: it blocked omp's event loop for the whole 20s recv timeout,
+ * stalling the UI and the agent loop. A trivial prompt went from 2s to over two
+ * minutes purely because of that, which looked exactly like a slow model.
+ * omp logs this as `ui.loop-blocked`.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
+import { promisify } from "node:util";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const PORT = process.env.AGENT_BUS_PORT ?? "47113";
+const run = promisify(execFile);
 
-/** Locate the bus CLI. Prefer PATH, fall back to the standard install. */
-function findBus(): string | null {
+/** Locate the bus CLI. Prefer an explicit override, then the standard install. */
+function findBus(): string {
   const fromEnv = process.env.AGENT_BUS_CLI;
   if (fromEnv && existsSync(fromEnv)) return fromEnv;
   const localAppData = process.env.LOCALAPPDATA;
@@ -35,30 +35,24 @@ function findBus(): string | null {
     const win = join(localAppData, "agent-bus", "bin", "bus.exe");
     if (existsSync(win)) return win;
   }
-  const home = process.env.HOME ?? process.env.USERPROFILE;
-  if (home) {
-    const nix = join(home, ".local", "bin", "bus");
-    if (existsSync(nix)) return nix;
-  }
-  return null; // let execFileSync fall back to PATH lookup
+  return "bus"; // fall back to PATH
 }
 
-function bus(args: string[], timeout = 15_000): string {
-  const exe = findBus();
-  return execFileSync(exe ?? "bus", args, {
+async function bus(args: string[], timeout = 15_000): Promise<string> {
+  const { stdout } = await run(findBus(), args, {
     encoding: "utf8",
     timeout,
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+    windowsHide: true,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  return String(stdout).trim();
 }
 
 export default function agentBusShim(pi: ExtensionAPI) {
   let room = "";
   let agentId = "";
   let stopped = false;
-  // Everything the poller has seen, keyed by message id. The poller drains the
-  // inbox, so without this a model asking `bus_read` later would find nothing.
-  const seen = new Map<string, unknown>();
+  let polling = false; // never overlap polls; a slow recv must not stack up
 
   const identify = (cwd: string) => {
     const project = basename(cwd) || "workspace";
@@ -66,8 +60,10 @@ export default function agentBusShim(pi: ExtensionAPI) {
     room = process.env.AGENT_BUS_ROOM ?? `#repo:${project}`;
   };
 
-  const listRoom = (limit = 20) => {
-    const raw = bus(["history", "--room", room, "--format", "json"]);
+  /** Read room history. History rather than recv: history does not consume, so
+   *  a model asking later still sees traffic the poller already drained. */
+  async function listRoom(limit = 20): Promise<any[]> {
+    const raw = await bus(["history", "--room", room, "--format", "json"]);
     return raw
       .split("\n")
       .map((l) => l.trim())
@@ -80,11 +76,17 @@ export default function agentBusShim(pi: ExtensionAPI) {
           return { text: l };
         }
       });
-  };
+  }
 
-  /** Register + join. Failures are reported, never thrown, so a bus outage
-   *  cannot stop someone from working. */
-  const attach = (ctx: any) => {
+  const format = (envs: any[]) =>
+    envs.map(
+      (e) =>
+        `[${e.kind}] ${e.from?.id ?? "?"}${e.reply_to ? ` (reply to ${e.reply_to})` : ""}: ${e.text ?? ""}`,
+    );
+
+  pi.on("session_start", async (_event, ctx) => {
+    identify(ctx?.cwd ?? process.cwd());
+
     const status = (text: string, variant: "info" | "warn" = "info") => {
       try {
         ctx?.ui?.setStatus?.("agent-bus", text, variant);
@@ -92,88 +94,75 @@ export default function agentBusShim(pi: ExtensionAPI) {
         /* UI is optional */
       }
     };
+
+    // Failures are reported, never thrown: a bus outage must not stop work.
     try {
-      bus(["register", "--agent", agentId, "--harness", "omp"]);
-      bus(["join", "--agent", agentId, "--room", room]);
+      await bus(["register", "--agent", agentId, "--harness", "omp"]);
+      await bus(["join", "--agent", agentId, "--room", room]);
       status(`${room} · joined`);
     } catch (e) {
       const why = e instanceof Error ? e.message.split("\n")[0] : String(e);
       status(`offline: ${why}`, "warn");
     }
-  };
 
-  pi.on("session_start", (_event, ctx) => {
-    identify(ctx?.cwd ?? process.cwd());
-    attach(ctx);
-
-    // Poll for inbound traffic. setInterval is session-owned: omp clears it on
-    // shutdown, so nothing leaks if the session dies.
+    // Poll for inbound traffic. The short recv keeps a cycle cheap; the loop
+    // is async so omp stays responsive between polls.
     ctx?.setInterval?.(() => {
-      if (stopped) return;
-      try {
-        // --format json is required: the default is human-readable text.
-        const raw = bus([
-          "recv",
-          "--agent",
-          agentId,
-          "--room",
-          room,
-          "--timeout",
-          "20",
-          "--format",
-          "json",
-        ]);
-        if (!raw) return;
-        const env = JSON.parse(raw);
-        if (env?.id) seen.set(env.id, env);
-        if (seen.size > 200) {
-          const oldest = seen.keys().next().value;
-          if (oldest) seen.delete(oldest);
-        }
-        const from = env?.from?.id ?? "someone";
-        const text = (env?.text ?? "").slice(0, 200);
-
-        // Tell the model. This is the whole point of the bus: without this the
-        // agent never learns anyone spoke, and the message only reaches the
-        // human watching the TUI.
+      if (stopped || polling) return;
+      polling = true;
+      void (async () => {
         try {
-          pi.sendMessage?.(
-            `[agent-bus] ${from} (${env.kind}) in ${room}:\n${env.text ?? ""}\n` +
-              `Reply with the bus_send tool if you want to answer.`,
+          // --format json is required: the default is human-readable text.
+          const raw = await bus(
+            ["recv", "--agent", agentId, "--room", room, "--timeout", "3", "--format", "json"],
+            12_000,
           );
+          if (!raw) return;
+          const env = JSON.parse(raw);
+          const from = env?.from?.id ?? "someone";
+
+          // Tell the model. Without this an agent receives on the bus and never
+          // knows, which is the whole failure mode this shim exists to fix.
+          try {
+            pi.sendMessage?.(
+              `[agent-bus] ${from} (${env.kind}) in ${room}:\n${env.text ?? ""}\n` +
+                `Reply with the bus_send tool if you want to answer.`,
+            );
+          } catch {
+            /* not available in every mode */
+          }
+          try {
+            ctx?.ui?.notify?.(
+              `agent-bus · ${env.kind} from ${from}: ${(env.text ?? "").slice(0, 200)}`,
+              "info",
+            );
+          } catch {
+            /* notify is a no-op in some modes */
+          }
         } catch {
-          /* not available in every mode */
+          /* timeout exits non-zero by design */
+        } finally {
+          polling = false;
         }
-        try {
-          ctx.ui?.notify?.(`agent-bus · ${env.kind} from ${from}: ${text}`, "info");
-        } catch {
-          /* notify is a no-op in some modes; the poll still drained it */
-        }
-      } catch {
-        /* timeout exits non-zero by design; nothing to report */
-      }
+      })();
     }, 1000);
 
-    // Tell the model at startup that the room exists at all. Without this the
-    // agent has no reason to ever reach for the bus.
-    pi.on("before_agent_start", (event) => {
-      let hint = "";
+    // Tell the model the room exists at all, or it has no reason to reach for it.
+    pi.on("before_agent_start", async () => {
+      let recent = "(room unreadable)";
       try {
-        hint = listRoom(5)
-          .map((e: any) => `- ${e.from?.id ?? "?"} (${e.kind}): ${e.text ?? ""}`)
-          .join("\n");
+        recent = format(await listRoom(5)).join("\n") || "(empty)";
       } catch {
-        hint = "(room unreadable)";
+        /* keep the fallback */
       }
       return {
         message:
           `You are on the agent bus in room ${room} as ${agentId}. ` +
           `Other agent harnesses talk here. Use bus_send to post and bus_read to read.\n` +
-          `Recent traffic:\n${hint}`,
+          `Recent traffic:\n${recent}`,
       };
     });
 
-    // Let the model post to the bus without shelling out itself.
     pi.registerTool({
       name: "bus_send",
       label: "Bus Send",
@@ -202,7 +191,7 @@ export default function agentBusShim(pi: ExtensionAPI) {
             params.text,
           ];
           if (params.replyTo) args.push("--reply-to", params.replyTo);
-          const out = bus(args);
+          const out = await bus(args);
           return {
             content: [{ type: "text", text: `sent to ${room}: ${out}` }],
             details: { room, kind: params.kind ?? "chat" },
@@ -217,9 +206,8 @@ export default function agentBusShim(pi: ExtensionAPI) {
         }
       },
     });
-  });
 
-  pi.registerTool({
+    pi.registerTool({
       name: "bus_read",
       label: "Bus Read",
       description:
@@ -230,11 +218,8 @@ export default function agentBusShim(pi: ExtensionAPI) {
       approval: "read",
       async execute(_id: string, params: { limit?: number }) {
         try {
-          const msgs = listRoom(params.limit ?? 20) as any[];
-          const lines = msgs.map(
-            (e) =>
-              `[${e.kind}] ${e.from?.id ?? "?"}${e.reply_to ? ` (reply to ${e.reply_to})` : ""}: ${e.text ?? ""}`,
-          );
+          const msgs = await listRoom(params.limit ?? 20);
+          const lines = format(msgs);
           return {
             content: [
               {
@@ -254,8 +239,9 @@ export default function agentBusShim(pi: ExtensionAPI) {
         }
       },
     });
+  });
 
-    pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", () => {
     stopped = true;
   });
 }
