@@ -56,11 +56,30 @@ export default function agentBusShim(pi: ExtensionAPI) {
   let room = "";
   let agentId = "";
   let stopped = false;
+  // Everything the poller has seen, keyed by message id. The poller drains the
+  // inbox, so without this a model asking `bus_read` later would find nothing.
+  const seen = new Map<string, unknown>();
 
   const identify = (cwd: string) => {
     const project = basename(cwd) || "workspace";
     agentId = process.env.AGENT_ID ?? `omp@${project}`;
     room = process.env.AGENT_BUS_ROOM ?? `#repo:${project}`;
+  };
+
+  const listRoom = (limit = 20) => {
+    const raw = bus(["history", "--room", room, "--format", "json"]);
+    return raw
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(-limit)
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return { text: l };
+        }
+      });
   };
 
   /** Register + join. Failures are reported, never thrown, so a bus outage
@@ -106,8 +125,25 @@ export default function agentBusShim(pi: ExtensionAPI) {
         ]);
         if (!raw) return;
         const env = JSON.parse(raw);
+        if (env?.id) seen.set(env.id, env);
+        if (seen.size > 200) {
+          const oldest = seen.keys().next().value;
+          if (oldest) seen.delete(oldest);
+        }
         const from = env?.from?.id ?? "someone";
         const text = (env?.text ?? "").slice(0, 200);
+
+        // Tell the model. This is the whole point of the bus: without this the
+        // agent never learns anyone spoke, and the message only reaches the
+        // human watching the TUI.
+        try {
+          pi.sendMessage?.(
+            `[agent-bus] ${from} (${env.kind}) in ${room}:\n${env.text ?? ""}\n` +
+              `Reply with the bus_send tool if you want to answer.`,
+          );
+        } catch {
+          /* not available in every mode */
+        }
         try {
           ctx.ui?.notify?.(`agent-bus · ${env.kind} from ${from}: ${text}`, "info");
         } catch {
@@ -117,6 +153,25 @@ export default function agentBusShim(pi: ExtensionAPI) {
         /* timeout exits non-zero by design; nothing to report */
       }
     }, 1000);
+
+    // Tell the model at startup that the room exists at all. Without this the
+    // agent has no reason to ever reach for the bus.
+    pi.on("before_agent_start", (event) => {
+      let hint = "";
+      try {
+        hint = listRoom(5)
+          .map((e: any) => `- ${e.from?.id ?? "?"} (${e.kind}): ${e.text ?? ""}`)
+          .join("\n");
+      } catch {
+        hint = "(room unreadable)";
+      }
+      return {
+        message:
+          `You are on the agent bus in room ${room} as ${agentId}. ` +
+          `Other agent harnesses talk here. Use bus_send to post and bus_read to read.\n` +
+          `Recent traffic:\n${hint}`,
+      };
+    });
 
     // Let the model post to the bus without shelling out itself.
     pi.registerTool({
@@ -164,7 +219,43 @@ export default function agentBusShim(pi: ExtensionAPI) {
     });
   });
 
-  pi.on("session_shutdown", () => {
+  pi.registerTool({
+      name: "bus_read",
+      label: "Bus Read",
+      description:
+        "Read recent traffic from the agent bus room. Use it to see what other agents have said, especially to answer a question addressed to you.",
+      parameters: pi.zod.object({
+        limit: pi.zod.number().optional().describe("How many recent messages (default 20)"),
+      }),
+      approval: "read",
+      async execute(_id: string, params: { limit?: number }) {
+        try {
+          const msgs = listRoom(params.limit ?? 20) as any[];
+          const lines = msgs.map(
+            (e) =>
+              `[${e.kind}] ${e.from?.id ?? "?"}${e.reply_to ? ` (reply to ${e.reply_to})` : ""}: ${e.text ?? ""}`,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: lines.length ? lines.join("\n") : "(no messages in this room yet)",
+              },
+            ],
+            details: { room, count: msgs.length },
+          };
+        } catch (e) {
+          const why = e instanceof Error ? e.message : String(e);
+          return {
+            content: [{ type: "text", text: `bus read failed: ${why}` }],
+            details: { error: why },
+            isError: true,
+          };
+        }
+      },
+    });
+
+    pi.on("session_shutdown", () => {
     stopped = true;
   });
 }
