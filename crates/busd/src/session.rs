@@ -127,7 +127,23 @@ pub async fn handle_conn(stream: TcpStream, state: Arc<AppState>) -> Result<()> 
     let mut tail_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Envelope>> = None;
     let mut tail_id: Option<u32> = None;
     loop {
-        tokio::select! {            n = read_line_capped(&mut reader, &mut line) => {                let n = n?;                if n == 0 { break; }                let msg = match decode_line(&line) {                    Ok(v) => v,                    Err(e) => {                        write(&mut writer, &err_value("frame", e.to_string())).await?;                        continue;                    }                };                let op = msg.get("op").and_then(|o| o.as_str()).unwrap_or_default().to_string();                match op.as_str() {                    OP_BYE => {                        write(&mut writer, &json!({"op": OP_BYE})).await?;                        break;                    }                    "register" => {                        op_register(&state, &msg, &mut writer).await?;                    }                    "join" => {                        op_join(&state, &me, &msg, &mut writer).await?;                    }                    "leave" => {                        op_leave(&state, &me, &msg, &mut writer).await?;                    }                    "send" => {                        op_send(&state, &me, &msg, &mut writer).await?;                    }                    "recv" => {                        op_recv(&state, &me, &msg, &mut writer).await?;                    }                    "history" => {                        op_history(&state, &msg, &mut writer).await?;                    }                    "who" => {                        op_who(&state, &msg, &mut writer).await?;                    }                    "rooms" => {                        op_rooms(&state, &mut writer).await?;                    }                    "tail" => {                        let rooms: Option<std::collections::HashSet<String>> = msg                            .get("rooms")                            .and_then(|r| r.as_array())                            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect());                        let kinds: Option<std::collections::HashSet<String>> = msg                            .get("kinds")                            .and_then(|k| k.as_array())                            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect());                        let (id, rx) = state.router.subscribe_tail(rooms, kinds);                        tail_id = Some(id);                        tail_rx = Some(rx);                        write(&mut writer, &json!({"op": "tail", "ok": true})).await?;                    }                    other => {                        write(&mut writer, &err_value("op", format!("unknown op {other:?}"))).await?;                    }                }            }            ev = async { match tail_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {                if let Some(env) = ev {                    write(&mut writer, &json!({"op": "msg", "envelope": env})).await?;                }            }        }
+        tokio::select! {            n = read_line_capped(&mut reader, &mut line) => {                let n = n?;                if n == 0 { break; }                let msg = match decode_line(&line) {                    Ok(v) => v,                    Err(e) => {                        write(&mut writer, &err_value("frame", e.to_string())).await?;                        continue;                    }                };                let op = msg.get("op").and_then(|o| o.as_str()).unwrap_or_default().to_string();                match op.as_str() {                    OP_BYE => {                        write(&mut writer, &json!({"op": OP_BYE})).await?;                        break;                    }                    "register" => {                        if let Err(e) = op_register(&state, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "join" => {                        if let Err(e) = op_join(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "leave" => {                        if let Err(e) = op_leave(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "send" => {                        if let Err(e) = op_send(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "recv" => {                        if let Err(e) = op_recv(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "history" => {                        if let Err(e) = op_history(&state, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "who" => {                        if let Err(e) = op_who(&state, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "rooms" => {                        if let Err(e) = op_rooms(&state, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "tail" => {                        let rooms: Option<std::collections::HashSet<String>> = msg                            .get("rooms")                            .and_then(|r| r.as_array())                            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect());                        let kinds: Option<std::collections::HashSet<String>> = msg                            .get("kinds")                            .and_then(|k| k.as_array())                            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect());                        let (id, rx) = state.router.subscribe_tail(rooms, kinds);                        tail_id = Some(id);                        tail_rx = Some(rx);                        write(&mut writer, &json!({"op": "tail", "ok": true})).await?;                    }                    other => {                        write(&mut writer, &err_value("op", format!("unknown op {other:?}"))).await?;                    }                }            }            ev = async { match tail_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {                if let Some(env) = ev {                    write(&mut writer, &json!({"op": "msg", "envelope": env})).await?;                }            }        }
     }
     if let Some(id) = tail_id {
         state.router.unsubscribe_tail(id);
@@ -184,6 +200,33 @@ async fn op_register(state: &AppState, msg: &Value, writer: &mut OwnedWriteHalf)
     .await?;
     Ok(())
 }
+/// Membership and messages both foreign-key into `agents`, so an identity that
+/// never registered gets a typed auth error instead of an opaque constraint
+/// failure. Returns false when the op must not proceed.
+async fn require_registered(
+    state: &AppState,
+    id: &str,
+    writer: &mut OwnedWriteHalf,
+) -> Result<bool> {
+    match state.store.is_registered(id) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            write(
+                writer,
+                &err_value(
+                    "auth",
+                    format!("{id} has not registered; run `bus register --agent {id}` first"),
+                ),
+            )
+            .await?;
+            Ok(false)
+        }
+        Err(e) => {
+            write(writer, &err_value("internal", e.to_string())).await?;
+            Ok(false)
+        }
+    }
+}
 async fn op_join(
     state: &AppState,
     me: &Option<Agent>,
@@ -210,6 +253,9 @@ async fn op_join(
         .await?;
         return Ok(());
     }
+    if !require_registered(state, &agent.id, writer).await? {
+        return Ok(());
+    }
     state.store.join(&agent.id, room)?;
     state.router.member_joined(room, &agent.id);
     let seq = state.store.room_seq(room)?;
@@ -234,6 +280,9 @@ async fn op_leave(
         write(writer, &err_value("payload", "leave requires room")).await?;
         return Ok(());
     };
+    if !require_registered(state, &agent.id, writer).await? {
+        return Ok(());
+    }
     state.store.leave(&agent.id, room)?;
     state.router.member_left(room, &agent.id);
     write(writer, &json!({"op": "left", "room": room})).await?;
@@ -263,6 +312,9 @@ async fn op_send(
             &err_value("payload", "room must be # prefixed, no whitespace"),
         )
         .await?;
+        return Ok(());
+    }
+    if !require_registered(state, &agent.id, writer).await? {
         return Ok(());
     }
     let Some(kind_str) = msg.get("kind").and_then(|k| k.as_str()) else {

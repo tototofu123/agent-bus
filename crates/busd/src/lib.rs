@@ -76,7 +76,10 @@ pub async fn run(cfg: Config) -> Result<()> {
             let owner = pid_from_file(&cfg.pid_file)
                 .map(|p| format!(" (pid {p})"))
                 .unwrap_or_default();
-            eprintln!("agent-busd: already running on port {}{owner} -- {e}", cfg.port);
+            eprintln!(
+                "agent-busd: already running on port {}{owner} -- {e}",
+                cfg.port
+            );
             return Ok(());
         }
     };

@@ -245,6 +245,19 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Has this identity ever registered? `members` and `messages` both foreign-key
+    /// into `agents`, so an identity that never registered has to be told to
+    /// register rather than hitting an opaque constraint failure.
+    pub fn is_registered(&self, agent: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM agents WHERE id=?1",
+            params![agent],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn join(&self, agent: &str, room: &str) -> Result<()> {
         self.ensure_room(room)?;
         let conn = self.conn.lock().unwrap();
