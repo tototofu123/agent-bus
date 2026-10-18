@@ -1,5 +1,7 @@
 //! `bus` — the universal adapter. One-shot commands over TCP loopback NDJSON.
 
+mod watch;
+
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use proto::{decode_line, encode_line, Agent};
@@ -33,6 +35,8 @@ enum Cmd {
     Recv(RecvArgs),
     /// Live-stream room traffic until Ctrl-C
     Tail(TailArgs),
+    /// Three-lane live view: main agent, subagents, report
+    Watch(WatchArgs),
     /// Who is here
     Who(WhoArgs),
     /// List rooms
@@ -110,6 +114,18 @@ struct TailArgs {
     agent: Option<String>,
 }
 
+#[derive(Args)]
+struct WatchArgs {
+    /// room to watch
+    #[arg(long, default_value = "#repo:agent-bus")]
+    room: String,
+    /// identity treated as the main agent (default $AGENT_ID)
+    #[arg(long)]
+    agent: Option<String>,
+    /// rows kept per lane
+    #[arg(long, default_value_t = 40)]
+    limit: usize,
+}
 #[derive(Args)]
 struct WhoArgs {
     #[arg(long)]
@@ -395,6 +411,104 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(env) = reply.get("envelope") {
                 println!("{}", fmt_env(env, &a.format));
             }
+        }
+        Cmd::Watch(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+            c.send_raw(&json!({"op": "tail", "rooms": [a.room.clone()]}))
+                .await?;
+            let ack = c.read_msg().await?;
+            if ack.get("op").and_then(|o| o.as_str()) != Some("tail") {
+                return Err(anyhow!("tail rejected: {ack}"));
+            }
+
+            let me = id.clone();
+            let cap = a.limit.max(4);
+            let feed = std::sync::Arc::new(std::sync::Mutex::new(watch::Feed::new(cap)));
+
+            // Reader runs in its own task so repainting is not gated on
+            // whether traffic happens to arrive.
+            let mut reader = c.reader;
+            let sink = feed.clone();
+            let reader_task = tokio::spawn(async move {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                    let Ok(v) = decode_line(line.trim_end_matches('\n').as_bytes()) else {
+                        continue;
+                    };
+                    if v.get("op").and_then(|o| o.as_str()) != Some("msg") {
+                        continue;
+                    }
+                    let Some(env) = v.get("envelope") else {
+                        continue;
+                    };
+                    let from = env
+                        .get("from")
+                        .and_then(|f| f.get("id"))
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let text = watch::env_line(env, from == me);
+                    if let Ok(mut f) = sink.lock() {
+                        if from == me {
+                            f.push_main(text);
+                        } else {
+                            f.push_sub(text);
+                        }
+                    }
+                }
+            });
+
+            // Alternate screen, so the user's scrollback survives exit.
+            print!("\x1b[?1049h\x1b[?25l");
+            let _ = std::io::stdout().flush();
+
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(400));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let (w, h) = watch::terminal_size();
+                        let lanes: [watch::Lane; 3] = feed.lock().map(|f| {
+                                [
+                                    watch::Lane {
+                                        title: format!("MAIN   {id}"),
+                                        rows: f.mine.clone(),
+                                    },
+                                    watch::Lane {
+                                        title: "SUBAGENTS   other bus members".into(),
+                                        rows: f.theirs.clone(),
+                                    },
+                                    watch::Lane {
+                                        title: "REPORT   reserved".into(),
+                                        rows: vec!["- not implemented yet -".into()],
+                                    },
+                                ]
+                            }).unwrap_or_else(|_| [
+                                watch::Lane { title: String::new(), rows: vec![] },
+                                watch::Lane { title: String::new(), rows: vec![] },
+                                watch::Lane { title: String::new(), rows: vec![] },
+                            ]);
+                        // Home the cursor, then redraw in place.
+                        print!("\x1b[H\x1b[2J{}", watch::render(w, h, &lanes));
+                        let _ = std::io::stdout().flush();
+                    }
+                    _ = &mut ctrl_c => break,
+                }
+            }
+
+            reader_task.abort();
+            print!("\x1b[?25h\x1b[?1049l");
+            let _ = std::io::stdout().flush();
         }
         Cmd::Tail(a) => {
             let id = default_agent(a.agent);
