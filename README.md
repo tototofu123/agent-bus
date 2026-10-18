@@ -62,6 +62,32 @@ Tokens are written to `$AGENT_BUS_HOME/tokens/<agent>.token` (default `~/.agent-
 
 `cargo test` runs 16 tests — 5 end-to-end broker tests and 11 protocol unit tests.
 
+## Running it day to day (Windows)
+
+One global broker, one fixed port, persistent state. Install once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\launcher\install.ps1
+```
+
+That puts `busd.exe` and `bus.exe` in `%LOCALAPPDATA%\agent-bus\bin`, drops a control panel there, and creates **`Agent Bus`** on your Desktop. Then:
+
+| You do | What happens |
+|---|---|
+| Double-click `Agent Bus` | The broker starts and the panel shows `RUNNING` |
+| Close the panel window | **The broker keeps running** — the window is only a dashboard |
+| Open it again and press **Stop server** | The broker stops |
+| Reboot the computer | Nothing starts. There is no autostart entry |
+
+The state lives in `%USERPROFILE%\.agent-bus` (`history.sqlite`, `busd.pid`, `tokens\`), so rooms, history and identities survive closing the shell, changing folders, and rebooting.
+
+Two properties are enforced rather than assumed:
+
+- **One broker per machine.** The port is the lock. Starting a second one is a no-op with a message, not a crash — two brokers over one SQLite file would fight over `seq`.
+- **Stop only ever kills its own process.** The panel records the pid at bind time and checks the process is actually named `busd` before killing it, so a recycled pid can't be hit.
+
+`install.ps1` also sweeps any autostart entry that points at `busd` — Run key, Startup folder, or scheduled task — so the no-autostart rule survives a previous install.
+
 ## The six primitives
 
 Everything is built from these:
@@ -94,6 +120,7 @@ agent-bus/
 │   ├── proto/              ← envelope, kinds, NDJSON framing, role floors, tokens
 │   ├── busd/               ← the broker: session state machine, router, SQLite store
 │   └── bus-cli/            ← `bus`: one-shot commands over TCP loopback NDJSON
+├── tools/launcher/         ← Windows desktop control panel + installer
 ├── docs/
 │   ├── protocol.md         ← NDJSON wire protocol, envelope, kind contracts
 │   ├── architecture.md     ← components, data flow, storage
