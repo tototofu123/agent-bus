@@ -10,8 +10,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::TcpStream;
+use crate::TransportStream;
 pub struct AppState {
     pub store: Store,
     pub router: Router,
@@ -70,9 +69,12 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec<u8>)
         r.consume(l);
     }
 }
-pub async fn handle_conn(stream: TcpStream, state: Arc<AppState>) -> Result<()> {
-    stream.set_nodelay(true).ok();
-    let (rd, wr) = stream.into_split();
+pub async fn handle_conn(stream: TransportStream, state: Arc<AppState>) -> Result<()> {
+    // set_nodelay only applies to TCP, skip for named pipes
+    if let TransportStream::Tcp(ref s) = stream {
+        s.set_nodelay(true).ok();
+    }
+    let (rd, wr) = tokio::io::split(stream);
     let mut reader = BufReader::with_capacity(64 * 1024, rd);
     let mut writer = wr;
     let mut line = Vec::with_capacity(4096); // -- handshake ----------------------------------------------------------
@@ -155,7 +157,7 @@ async fn write<W: AsyncWrite + Unpin>(w: &mut W, v: &Value) -> Result<()> {
     w.flush().await?;
     Ok(())
 }
-async fn op_register(state: &AppState, msg: &Value, writer: &mut OwnedWriteHalf) -> Result<()> {
+async fn op_register(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     let agent: Agent = match msg
         .get("agent")
         .and_then(|a| serde_json::from_value(a.clone()).ok())
@@ -206,7 +208,7 @@ async fn op_register(state: &AppState, msg: &Value, writer: &mut OwnedWriteHalf)
 async fn require_registered(
     state: &AppState,
     id: &str,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<bool> {
     match state.store.is_registered(id) {
         Ok(true) => Ok(true),
@@ -231,7 +233,7 @@ async fn op_join(
     state: &AppState,
     me: &Option<Agent>,
     msg: &Value,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
     let Some(agent) = me else {
         write(
@@ -266,7 +268,7 @@ async fn op_leave(
     state: &AppState,
     me: &Option<Agent>,
     msg: &Value,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
     let Some(agent) = me else {
         write(
@@ -292,7 +294,7 @@ async fn op_send(
     state: &AppState,
     me: &Option<Agent>,
     msg: &Value,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
     let Some(agent) = me else {
         write(
@@ -360,7 +362,7 @@ async fn op_recv(
     state: &AppState,
     me: &Option<Agent>,
     msg: &Value,
-    writer: &mut OwnedWriteHalf,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
     let room = msg.get("room").and_then(|r| r.as_str());
     let timeout_ms = msg
@@ -379,7 +381,7 @@ async fn op_recv(
     }
     Ok(())
 }
-async fn op_history(state: &AppState, msg: &Value, writer: &mut OwnedWriteHalf) -> Result<()> {
+async fn op_history(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     let Some(room) = msg.get("room").and_then(|r| r.as_str()) else {
         write(writer, &err_value("payload", "history requires room")).await?;
         return Ok(());
@@ -398,7 +400,7 @@ async fn op_history(state: &AppState, msg: &Value, writer: &mut OwnedWriteHalf) 
     .await?;
     Ok(())
 }
-async fn op_who(state: &AppState, msg: &Value, writer: &mut OwnedWriteHalf) -> Result<()> {
+async fn op_who(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     let room = msg.get("room").and_then(|r| r.as_str());
     let agents = state.store.who(room)?;
     write(
@@ -408,7 +410,7 @@ async fn op_who(state: &AppState, msg: &Value, writer: &mut OwnedWriteHalf) -> R
     .await?;
     Ok(())
 }
-async fn op_rooms(state: &AppState, writer: &mut OwnedWriteHalf) -> Result<()> {
+async fn op_rooms(state: &AppState, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     let rooms = state.store.rooms()?;
     write(
         writer,

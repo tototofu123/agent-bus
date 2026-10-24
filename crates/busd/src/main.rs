@@ -5,6 +5,7 @@ fn main() -> Result<()> {
     let mut port: u16 = 47113;
     let mut db: Option<PathBuf> = None;
     let mut pid_file: Option<PathBuf> = None;
+    let mut pipe_path: Option<String> = None;
     let mut status = false;
 
     let mut args = std::env::args().skip(1);
@@ -13,9 +14,14 @@ fn main() -> Result<()> {
             "--port" => port = args.next().and_then(|v| v.parse().ok()).unwrap_or(port),
             "--db" => db = args.next().map(PathBuf::from),
             "--pid-file" => pid_file = args.next().map(PathBuf::from),
+            "--pipe" => pipe_path = args.next(),
             "--status" => status = true,
             "--version" => {
                 println!("agent-busd {}", proto::V);
+                return Ok(());
+            }
+            "--help" => {
+                print_usage();
                 return Ok(());
             }
             _ => {}
@@ -56,6 +62,7 @@ fn main() -> Result<()> {
         port,
         db_path,
         pid_file: pid_path,
+        pipe_path,
     }))
 }
 
@@ -64,4 +71,32 @@ fn home_dir() -> PathBuf {
         .or_else(|_| std::env::var("HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn print_usage() {
+    println!(
+        r#"agent-busd {} — local agent message bus
+
+USAGE:
+    agent-busd [OPTIONS]
+
+OPTIONS:
+    --port <PORT>        TCP port to listen on (default: 47113)
+    --db <PATH>          SQLite database path (default: $AGENT_BUS_HOME/history.sqlite)
+    --pid-file <PATH>    PID file path (default: $AGENT_BUS_HOME/busd.pid)
+    --pipe <PATH>        Windows named pipe path (default: \\.\pipe\agent-busd)
+    --status             Check if broker is running (exit 0 if running, 1 if stopped)
+    --version            Print version and exit
+    --help               Print this help and exit
+
+ENVIRONMENT:
+    AGENT_BUS_HOME       Base directory for data files (default: ~/.agent-bus)
+    AGENT_BUS_PORT       Default TCP port (default: 47113)
+
+TRANSPORTS:
+    Windows: Named pipe (\\.\pipe\agent-busd) with TCP loopback fallback
+    Unix:    Unix socket with TCP loopback fallback
+"#,
+        proto::V
+    );
 }

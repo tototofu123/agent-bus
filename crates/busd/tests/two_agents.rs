@@ -32,7 +32,7 @@ async fn start_server() -> Result<Server> {
     state.warm_members()?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let port = listener.local_addr()?.port();
-    tokio::spawn(busd::serve(listener, state));
+    tokio::spawn(busd::serve(busd::TransportListener::Tcp(listener), state));
     Ok(Server { port, _db: db })
 }
 
