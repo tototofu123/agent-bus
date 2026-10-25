@@ -4,7 +4,7 @@ use crate::store::{broker_envelope, Store};
 use anyhow::{anyhow, Result};
 use proto::{
     decode_line, encode_line, hash_token, new_token, Agent, Envelope, Kind, Role, Trust,
-    MAX_LINE_BYTES, OP_BYE, OP_ERROR, OP_HELLO, OP_SENT, OP_WELCOME, V,
+    MAX_LINE_BYTES, OP_BYE, OP_ERROR, OP_HELLO, OP_SENT, OP_SENT_BATCH, OP_WELCOME, V,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -136,6 +136,8 @@ pub async fn handle_conn(stream: TransportStream, state: Arc<AppState>) -> Resul
         }                    }                    "leave" => {                        if let Err(e) = op_leave(&state, &me, &msg, &mut writer).await {
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
         }                    }                    "send" => {                        if let Err(e) = op_send(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "send_batch" => {                        if let Err(e) = op_send_batch(&state, &me, &msg, &mut writer).await {
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
         }                    }                    "recv" => {                        if let Err(e) = op_recv(&state, &me, &msg, &mut writer).await {
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
@@ -335,14 +337,7 @@ async fn op_send(
         return Ok(());
     }
     let role = state.store.agent_role(&agent.id)?.unwrap_or(Role::Protocol);
-    let mut env = Envelope::new(&room, agent.clone(), kind);
-    env.text = msg.get("text").and_then(|t| t.as_str().map(String::from));
-    env.payload = msg.get("payload").cloned().filter(|p| !p.is_null());
-    env.thread = msg.get("thread").and_then(|t| t.as_str().map(String::from));
-    env.reply_to = msg
-        .get("reply_to")
-        .and_then(|t| t.as_str().map(String::from));
-    env.lamport = msg.get("lamport").and_then(|l| l.as_u64()).unwrap_or(0);
+    let mut env = envelope_from_op(&room, agent, msg, kind);
     if let Err((code, m)) = crate::router::validate_send(&env, kind, role) {
         write(writer, &err_value(&code, m)).await?;
         return Ok(());
@@ -367,6 +362,131 @@ async fn op_send(
     write(writer, &reply).await?;
     Ok(())
 }
+/// Build an envelope from a client `send`/`send_batch` message body. Shared so
+/// the single and batch paths accept exactly the same fields.
+fn envelope_from_op(room: &str, agent: &Agent, msg: &Value, kind: Kind) -> Envelope {
+    let mut env = Envelope::new(room, agent.clone(), kind);
+    env.text = msg.get("text").and_then(|t| t.as_str().map(String::from));
+    env.payload = msg.get("payload").cloned().filter(|p| !p.is_null());
+    env.thread = msg.get("thread").and_then(|t| t.as_str().map(String::from));
+    env.reply_to = msg
+        .get("reply_to")
+        .and_then(|t| t.as_str().map(String::from));
+    env.lamport = msg.get("lamport").and_then(|l| l.as_u64()).unwrap_or(0);
+    env
+}
+
+/// `send_batch` — many envelopes in one frame, appended in one transaction.
+///
+/// `busd` replied to each single-message `send` with its own commit; the
+/// throughput gate measured that ceiling at ~8k msg/s, which the store itself
+/// exhibits with no sockets in play. This op amortises one commit across up to
+/// `proto::MAX_BATCH` envelopes, so a room being driven hard pays one fsync for
+/// the batch.
+///
+/// Reply is one `sent_batch` carrying all seqs, so an ack still maps 1:1 to the
+/// messages the client asked to send.
+async fn op_send_batch(
+    state: &AppState,
+    me: &Option<Agent>,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    let Some(agent) = me else {
+        write(
+            writer,
+            &err_value("proto", "hello with agent required first"),
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(room) = msg.get("room").and_then(|r| r.as_str()).map(String::from) else {
+        write(writer, &err_value("payload", "send_batch requires room")).await?;
+        return Ok(());
+    };
+    if !valid_room(&room) {
+        write(
+            writer,
+            &err_value("payload", "room must be # prefixed, no whitespace"),
+        )
+        .await?;
+        return Ok(());
+    }
+    let Some(items) = msg.get("messages").and_then(|m| m.as_array()) else {
+        write(
+            writer,
+            &err_value("payload", "send_batch requires messages[]"),
+        )
+        .await?;
+        return Ok(());
+    };
+    if items.is_empty() {
+        write(writer, &err_value("payload", "send_batch has no messages")).await?;
+        return Ok(());
+    }
+    if items.len() > proto::MAX_BATCH {
+        write(
+            writer,
+            &err_value("payload", format!("send_batch over {} messages", proto::MAX_BATCH)),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Build every envelope first: a frame that cannot parse must not leave a
+    // half-committed batch behind.
+    let role = state.store.agent_role(&agent.id)?.unwrap_or(Role::Protocol);
+    let mut built: Vec<(Envelope, Kind)> = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(kind_str) = item.get("kind").and_then(|k| k.as_str()) else {
+            write(writer, &err_value("payload", "each message requires kind")).await?;
+            return Ok(());
+        };
+        let Some(kind) = Kind::parse(kind_str) else {
+            write(
+                writer,
+                &err_value("payload", format!("unknown kind {kind_str:?}")),
+            )
+            .await?;
+            return Ok(());
+        };
+        let env = envelope_from_op(&room, agent, item, kind);
+        // Validate before anything is written, so a rejected frame rejects wholly.
+        if let Err((code, m)) = crate::router::validate_send(&env, kind, role) {
+            write(writer, &err_value(&code, m)).await?;
+            return Ok(());
+        }
+        built.push((env, kind));
+    }
+
+    // One rate check per frame against the message count, so a batch cannot be
+    // used to slip past the 60 msg/s policy in bulk.
+    if !state.router.rate_check_batch(&agent.id, built.len()) {
+        write(writer, &err_value("rate", "over 60 msg/s")).await?;
+        return Ok(());
+    }
+
+    let Some(seqs) = state.store.append_batch(&mut built)? else {
+        write(
+            writer,
+            &err_value("auth", "anonymous@bus has not registered; run `bus register` first"),
+        )
+        .await?;
+        return Ok(());
+    };
+    for (env, _) in &built {
+        state.router.fan_out(env);
+    }
+
+    let ids: Vec<&str> = built.iter().map(|(e, _)| e.id.as_str()).collect();
+    write(
+        writer,
+        &json!({"op": OP_SENT_BATCH, "ids": ids, "seqs": seqs, "room": room, "count": seqs.len()}),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn op_recv(
     state: &AppState,
     me: &Option<Agent>,

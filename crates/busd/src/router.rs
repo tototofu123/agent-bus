@@ -160,6 +160,18 @@ impl Router {
         true
     }
 
+    /// Trade `n` rate-limit slots for one check, so a `send_batch` frame counts
+    /// as `n` messages for policy purposes rather than one. This is what stops
+    /// batching from being a way to bypass the 60 msg/s limit in bulk.
+    pub fn rate_check_batch(&self, agent: &str, n: usize) -> bool {
+        for _ in 0..n {
+            if !self.rate_check(agent) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Agents whose send rate is being measured rather than governed.
     ///
     /// The 60 msg/s limit exists to keep one agent from starving a room, so it

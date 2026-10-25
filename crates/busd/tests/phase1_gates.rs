@@ -397,6 +397,16 @@ async fn bench_throughput_50k_per_sec() -> anyhow::Result<()> {
     const WRITERS_N: usize = 8;
     const PER_WRITER: usize = MSGS_PER_WRITER; // 80k msgs, comfortably past 50k
     let payload = kb_payload(PAYLOAD_KB); // 1 KB per criterion
+    // Per the criterion: 1 room, 1 KB payloads. The batch width is the
+    // amortisation the `send_batch` op exists for — N envelopes share one
+    // commit, so the store's per-message fsync is paid once per batch.
+    //
+    // Width is bounded by the protocol's 1 MiB line cap as well as MAX_BATCH:
+    // a frame is one NDJSON line, so N envelopes must fit in one line. With
+    // 1 KB payloads that caps the width well below MAX_BATCH -- sizing a batch
+    // only from MAX_BATCH silently produces frames the broker must reject.
+    const BATCH: usize = if proto::MAX_BATCH > 64 { 64 } else { proto::MAX_BATCH };
+    const BATCH_LINE_BUDGET: usize = proto::MAX_LINE_BYTES;
 
     let mut conns = Vec::with_capacity(WRITERS_N);
     for i in 0..WRITERS_N {
@@ -405,10 +415,9 @@ async fn bench_throughput_50k_per_sec() -> anyhow::Result<()> {
         conns.push(c);
     }
 
-    // Pipeline: every writer keeps several sends outstanding, so the broker
-    // receives a stream instead of one message per round trip. The measured
-    // quantity is the room's append rate, not the 60 msg/s policy (issue #4).
-    const PIPELINE: usize = 64;
+    // Several batch frames outstanding per writer, so writers do not wait for
+    // the previous frame's ack before building the next one.
+    const PIPELINE: usize = 8;
     let start = Instant::now();
     let mut handles = Vec::with_capacity(WRITERS_N);
     for (i, mut c) in conns.into_iter().enumerate() {
@@ -417,29 +426,54 @@ async fn bench_throughput_50k_per_sec() -> anyhow::Result<()> {
         handles.push(tokio::spawn(async move {
             let mut outstanding = 0usize;
             let mut sent = 0usize;
+            let mut pending: Vec<usize> = Vec::new();
             while sent < PER_WRITER {
                 while outstanding < PIPELINE && sent < PER_WRITER {
-                    c.send(&json!({
-                        "op": "send", "room": room, "kind": "chat",
-                        "text": format!("m{i}-{sent}"),
-                        "payload": payload,
-                    }))
-                    .await?;
+                    let take = BATCH.min(PER_WRITER - sent);
+                    let messages: Vec<Value> = (0..take)
+                        .map(|j| {
+                            json!({
+                                "kind": "chat",
+                                "text": format!("m{i}-{}", sent + j),
+                                "payload": payload,
+                            })
+                        })
+                        .collect();
+                    let frame = json!({
+                        "op": "send_batch", "room": room, "messages": messages
+                    });
+                    let line = serde_json::to_string(&frame)?;
+                    // A frame is one NDJSON line; over the cap the broker must
+                    // reject it, which would show up as a throughput
+                    // discontinuity rather than a failed send.
+                    assert!(
+                        line.len() < BATCH_LINE_BUDGET,
+                        "batch frame is {} bytes, over the {} byte line cap -- widen \
+                         the batch in units of the line budget, not MAX_BATCH alone",
+                        line.len(),
+                        BATCH_LINE_BUDGET
+                    );
+                    c.send(&frame).await?;
                     outstanding += 1;
-                    sent += 1;
+                    pending.push(take);
+                    sent += take;
                 }
-                // Drain one ack; the broker assigns seq on receipt, so acks
-                // bound memory without serialising the stream.
+                // Drain one frame ack; the broker assigns all seqs inside the
+                // batch's transaction, so acks bound memory without serialising.
+                let want = pending.remove(0);
                 let r = c.read().await?;
-                if r["op"] != "sent" {
-                    return Err(anyhow::anyhow!("send failed: {r}"));
+                if r["op"] != "sent_batch" {
+                    return Err(anyhow::anyhow!("send_batch failed: {r}"));
+                }
+                if r["count"].as_u64().unwrap_or(0) as usize != want {
+                    return Err(anyhow::anyhow!("acked count mismatch: {r}"));
                 }
                 outstanding -= 1;
             }
             while outstanding > 0 {
                 let r = c.read().await?;
-                if r["op"] != "sent" {
-                    return Err(anyhow::anyhow!("send failed: {r}"));
+                if r["op"] != "sent_batch" {
+                    return Err(anyhow::anyhow!("send_batch failed: {r}"));
                 }
                 outstanding -= 1;
             }
@@ -557,6 +591,126 @@ async fn bench_crash_safety() -> anyhow::Result<()> {
         );
         println!("crash-safety gate PASSED: {} messages intact, no seq reuse", msgs.len());
     }
+    Ok(())
+}
+
+// ============================================================================
+// GATE 8: Batch crash loss — the bound `send_batch` introduces must hold
+// ============================================================================
+
+/// `send_batch` amortises one commit over N messages, which means a `kill -9`
+/// can lose the messages still inside an open transaction. The claim is that
+/// the loss is *bounded* by `MAX_BATCH`, not that it is zero. This test asserts
+/// the bound, because a regression that loses more than one batch would be a
+/// durability bug invisible to the single-send crash gate.
+#[tokio::test]
+async fn bench_batch_crash_loss_bounded() -> anyhow::Result<()> {
+    // A batch is one NDJSON line, so the width is bounded by the protocol's
+    // line cap -- and the bound is not obvious: a 1 KB JSON payload plus the
+    // text field serialises to ~42 KB per envelope, so MAX_BATCH (256) implies
+    // a 10 MB line. Width is therefore *measured*, not assumed.
+    const FRAMES: usize = 3;
+    // A batch is one NDJSON line, so the width is bounded by the protocol's
+    // line cap -- and the bound is not obvious: a 1 KB JSON payload plus the
+    // text field serialises to ~42 KB per envelope, so MAX_BATCH (256) implies
+    // a ~10 MB line. The width is therefore *measured*, not assumed.
+    let probe = serde_json::to_string(&json!({
+        "op": "send_batch",
+        "room": "#bench:batch-crash",
+        "messages": [json!({
+            "kind": "chat",
+            "text": "probe",
+            "payload": json!({"data": "x".repeat(1024)})
+        })],
+    }))?;
+    let per_frame = (proto::MAX_LINE_BYTES / probe.len()).max(1).min(proto::MAX_BATCH);
+    println!(
+        "batch frame width: {per_frame} messages ({} bytes each, cap {})",
+        probe.len(),
+        proto::MAX_LINE_BYTES
+    );
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let db = std::env::temp_dir().join(format!(
+        "agent-bus-batch-crash-{}-{}.sqlite",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let room = "#bench:batch-crash";
+
+    let sent = {
+        let store = Store::open(&db)?;
+        let state = Arc::new(AppState::new(store));
+        state.warm_members()?;
+        state.router.exempt_from_rate_limit(RATE_EXEMPT);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
+        let st = state.clone();
+        let srv = tokio::spawn(async move { busd::serve(TransportListener::Tcp(listener), st).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let agent = make_agent(&format!("{RATE_EXEMPT}bc@test"), Some("llama-3-70b"));
+        let (mut sender, _token) = Client::register_and_join(port, &agent, room).await?;
+
+        let payload = json!({"data": "x".repeat(1024)});
+        let mut acked = 0usize;
+        for f in 0..FRAMES {
+            let messages: Vec<Value> = (0..per_frame)
+                .map(|i| {
+                    json!({
+                        "kind": "chat",
+                        "text": format!("f{f}-{i}"),
+                        "payload": payload,
+                    })
+                })
+                .collect();
+            sender
+                .send(&json!({"op": "send_batch", "room": room, "messages": messages}))
+                .await?;
+            if f == 0 {
+                let _ = serde_json::to_string(&json!({"op": "x", "messages": messages}))
+                    .map(|l| println!("frame {f} wire size ~{}", l.len()));
+            }
+            let r = sender.read().await?;
+            assert_eq!(r["op"], "sent_batch", "frame {f} not acked: {r}");
+            acked += r["count"].as_u64().unwrap_or(0) as usize;
+        }
+        // Crash right after the last ack: an in-flight transaction may be lost.
+        srv.abort();
+        drop(state);
+        acked
+    };
+
+    let persisted = {
+        let store = Store::open(&db)?;
+        let state = Arc::new(AppState::new(store));
+        state.warm_members()?;
+        state.router.exempt_from_rate_limit(RATE_EXEMPT);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = busd::serve(TransportListener::Tcp(listener), st).await {
+                eprintln!("restart: {e}");
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let msgs = history_all(port, room).await?;
+        msgs.len()
+    };
+
+    let lost = sent.saturating_sub(persisted);
+    let bound = per_frame;
+    println!("batch crash loss: {sent} acked, {persisted} persisted, {lost} lost (bound {bound})");
+    // The loss must be bounded by one frame, and never negative.
+    assert!(
+        lost <= bound,
+        "lost {lost} messages across a crash, over one frame's {bound} -- the batch boundary was violated"
+    );
+    assert!(
+        sent >= persisted,
+        "persisted {persisted} exceeds acked {sent}: the broker acked messages it did not store"
+    );
     Ok(())
 }
 

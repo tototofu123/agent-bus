@@ -500,6 +500,14 @@ pub const OP_WELCOME: &str = "welcome";
 pub const OP_BYE: &str = "bye";
 pub const OP_ERROR: &str = "error";
 pub const OP_SENT: &str = "sent";
+pub const OP_SENT_BATCH: &str = "sent_batch";
+
+/// Hard cap on envelopes in one `send_batch` frame.
+///
+/// Larger than this and a single frame's transaction holds too much
+/// uncommitted work for the crash-loss bound to stay meaningful; smaller and
+/// there is nothing to amortise.
+pub const MAX_BATCH: usize = 256;
 
 #[cfg(test)]
 mod tests {
