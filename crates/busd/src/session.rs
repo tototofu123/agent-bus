@@ -45,6 +45,13 @@ fn err_value(code: &str, msg: impl AsRef<str>) -> Value {
     json!({"op": OP_ERROR, "code": code, "message": msg.as_ref()})
 }
 // Read one NDJSON line with a hard cap. Frame violations are fatal.
+//
+// A line longer than the BufReader's buffer spans several `fill_buf` chunks, so
+// the newline is often found in a *later* chunk than the first. Within that
+// later chunk the newline offset is only the tail of the line -- the earlier
+// chunks are already accumulated in `buf` -- so the returned length is
+// `buf.len()`, not the newline offset. Returning the offset alone silently
+// truncated every frame larger than the buffer.
 async fn read_line_capped<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> {
     buf.clear();
     loop {
@@ -56,10 +63,13 @@ async fn read_line_capped<R: AsyncBufRead + Unpin>(r: &mut R, buf: &mut Vec<u8>)
             return Ok(0); // EOF
         }
         if let Some(nl) = available.iter().position(|&b| b == b'\n') {
-            let take = nl + 1;
-            buf.extend_from_slice(&available[..take]);
-            r.consume(take);
-            return Ok(take);
+            let tail = nl + 1;
+            buf.extend_from_slice(&available[..tail]);
+            r.consume(tail);
+
+            // `buf` now holds the whole line: the chunks accumulated by earlier
+            // iterations plus this chunk up to and including its newline.
+            return Ok(buf.len());
         }
         if buf.len() + available.len() > MAX_LINE_BYTES {
             return Err(anyhow!("line exceeds {} bytes", MAX_LINE_BYTES));

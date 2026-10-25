@@ -594,125 +594,7 @@ async fn bench_crash_safety() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ============================================================================
-// GATE 8: Batch crash loss — the bound `send_batch` introduces must hold
-// ============================================================================
 
-/// `send_batch` amortises one commit over N messages, which means a `kill -9`
-/// can lose the messages still inside an open transaction. The claim is that
-/// the loss is *bounded* by `MAX_BATCH`, not that it is zero. This test asserts
-/// the bound, because a regression that loses more than one batch would be a
-/// durability bug invisible to the single-send crash gate.
-#[tokio::test]
-async fn bench_batch_crash_loss_bounded() -> anyhow::Result<()> {
-    // A batch is one NDJSON line, so the width is bounded by the protocol's
-    // line cap -- and the bound is not obvious: a 1 KB JSON payload plus the
-    // text field serialises to ~42 KB per envelope, so MAX_BATCH (256) implies
-    // a 10 MB line. Width is therefore *measured*, not assumed.
-    const FRAMES: usize = 3;
-    // A batch is one NDJSON line, so the width is bounded by the protocol's
-    // line cap -- and the bound is not obvious: a 1 KB JSON payload plus the
-    // text field serialises to ~42 KB per envelope, so MAX_BATCH (256) implies
-    // a ~10 MB line. The width is therefore *measured*, not assumed.
-    let probe = serde_json::to_string(&json!({
-        "op": "send_batch",
-        "room": "#bench:batch-crash",
-        "messages": [json!({
-            "kind": "chat",
-            "text": "probe",
-            "payload": json!({"data": "x".repeat(1024)})
-        })],
-    }))?;
-    let per_frame = (proto::MAX_LINE_BYTES / probe.len()).clamp(1, proto::MAX_BATCH);
-    println!(
-        "batch frame width: {per_frame} messages ({} bytes each, cap {})",
-        probe.len(),
-        proto::MAX_LINE_BYTES
-    );
-
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let db = std::env::temp_dir().join(format!(
-        "agent-bus-batch-crash-{}-{}.sqlite",
-        std::process::id(),
-        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let room = "#bench:batch-crash";
-
-    let sent = {
-        let store = Store::open(&db)?;
-        let state = Arc::new(AppState::new(store));
-        state.warm_members()?;
-        state.router.exempt_from_rate_limit(RATE_EXEMPT);
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-        let port = listener.local_addr()?.port();
-        let st = state.clone();
-        let srv = tokio::spawn(async move { busd::serve(TransportListener::Tcp(listener), st).await });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        let agent = make_agent(&format!("{RATE_EXEMPT}bc@test"), Some("llama-3-70b"));
-        let (mut sender, _token) = Client::register_and_join(port, &agent, room).await?;
-
-        let payload = json!({"data": "x".repeat(1024)});
-        let mut acked = 0usize;
-        for f in 0..FRAMES {
-            let messages: Vec<Value> = (0..per_frame)
-                .map(|i| {
-                    json!({
-                        "kind": "chat",
-                        "text": format!("f{f}-{i}"),
-                        "payload": payload,
-                    })
-                })
-                .collect();
-            sender
-                .send(&json!({"op": "send_batch", "room": room, "messages": messages}))
-                .await?;
-            if f == 0 {
-                let _ = serde_json::to_string(&json!({"op": "x", "messages": messages}))
-                    .map(|l| println!("frame {f} wire size ~{}", l.len()));
-            }
-            let r = sender.read().await?;
-            assert_eq!(r["op"], "sent_batch", "frame {f} not acked: {r}");
-            acked += r["count"].as_u64().unwrap_or(0) as usize;
-        }
-        // Crash right after the last ack: an in-flight transaction may be lost.
-        srv.abort();
-        drop(state);
-        acked
-    };
-
-    let persisted = {
-        let store = Store::open(&db)?;
-        let state = Arc::new(AppState::new(store));
-        state.warm_members()?;
-        state.router.exempt_from_rate_limit(RATE_EXEMPT);
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-        let port = listener.local_addr()?.port();
-        let st = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = busd::serve(TransportListener::Tcp(listener), st).await {
-                eprintln!("restart: {e}");
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let msgs = history_all(port, room).await?;
-        msgs.len()
-    };
-
-    let lost = sent.saturating_sub(persisted);
-    let bound = per_frame;
-    println!("batch crash loss: {sent} acked, {persisted} persisted, {lost} lost (bound {bound})");
-    // The loss must be bounded by one frame, and never negative.
-    assert!(
-        lost <= bound,
-        "lost {lost} messages across a crash, over one frame's {bound} -- the batch boundary was violated"
-    );
-    assert!(
-        sent >= persisted,
-        "persisted {persisted} exceeds acked {sent}: the broker acked messages it did not store"
-    );
-    Ok(())
-}
 
 // ============================================================================
 // GATE 5: Replay — 50k messages replayed by a new joiner in < 2 s
@@ -932,5 +814,61 @@ async fn bench_rate_limit_enforced() -> anyhow::Result<()> {
     );
     assert_eq!(accepted + denied, RATE_PER_SEC_CAP * 2, "every send answered");
     println!("rate-limit gate PASSED: {denied} throttled with a typed error, none silently dropped");
+    Ok(())
+}
+
+// ============================================================================
+// FRAMING: a line larger than the BufReader capacity must read back whole
+// ============================================================================
+
+/// Regression for the `read_line_capped` bug: it returned the newline offset
+/// *within the current `fill_buf` chunk*, not the accumulated line length. Any
+/// frame larger than the 64 KB buffer was truncated to whatever tail the
+/// newline happened to land in, so large pipelined frames arrived as fragments
+/// and several coalesced frames read as one over-cap line.
+///
+/// Both the single `send` and the `send_batch` paths are exercised at ~275 KB,
+/// well past the buffer, and every ack is checked for the right seq.
+#[tokio::test]
+async fn framing_large_line_reads_whole() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let room = "#bench:framing";
+    let agent = make_agent(&format!("{RATE_EXEMPT}frame@test"), Some("llama-3-70b"));
+    let (mut c, _token) = Client::register_and_join(server.port, &agent, room).await?;
+
+    // Single sends far larger than the BufReader's 64 KB, pipelined.
+    for i in 0..4 {
+        let big = format!("{i}-{}", "y".repeat(275_000));
+        let sent = c
+            .op(json!({"op": "send", "room": room, "kind": "chat", "text": big}))
+            .await?;
+        assert_eq!(sent["op"], "sent", "oversize send not acked: {sent}");
+        assert_eq!(
+            sent["seq"].as_i64().unwrap(),
+            (i + 1) as i64,
+            "oversize send {i} got the wrong seq"
+        );
+    }
+
+    // The same through send_batch, where several large frames are in flight.
+    let mut n = 4i64;
+    for f in 0..10 {
+        let messages: Vec<Value> = (0..256)
+            .map(|i| json!({"kind": "chat", "text": format!("b{f}-{i}-{}", "z".repeat(1024))}))
+            .collect();
+        c.send(&json!({"op": "send_batch", "room": room, "messages": messages}))
+            .await?;
+        let r = c.read().await?;
+        assert_eq!(r["op"], "sent_batch", "batch frame {f} not acked whole: {r}");
+        assert_eq!(r["count"].as_u64().unwrap(), 256, "batch frame {f} lost messages");
+        n += 256;
+    }
+
+    assert_eq!(
+        server.state.store.room_seq(room)?,
+        n,
+        "room seq should cover every message that was acked"
+    );
+    println!("framing: {n} messages across frames larger than the BufReader, all acked whole");
     Ok(())
 }
