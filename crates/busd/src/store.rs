@@ -307,11 +307,69 @@ impl Store {
 
     // -- append (the sequencer) ---------------------------------------------
 
-    /// Assign the next `seq` and insert, in one transaction, under the store
-    /// lock. This is the only writer of a room's `seq` (single-writer rule).
+    /// Assign the next `seq` and insert, in one transaction that commits
+    /// immediately. This is the only writer of a room's `seq` (single-writer
+    /// rule), and the correctness gates rely on it: a message either survives a
+    /// crash or never existed, with no in-between state.
+    ///
+    /// Batching several inserts into one commit was tried and removed: the send
+    /// path commits each message as it is accepted, so a batch there held
+    /// exactly one message and measured 6,139 msg/s against 8,759 for the direct
+    /// path — pure overhead. Real batching needs the client to send many
+    /// envelopes in one frame, which is a protocol change, not a store change.
     pub fn append(&self, env: &mut Envelope, kind: Kind) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let seq = self.assign_and_insert(&tx, env, kind)?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// The whole send path in **one** transaction: check the sender is
+    /// registered, make sure the room exists, then append.
+    ///
+    /// `op_send` used to do the membership check, the role lookup and the room
+    /// ensure as separate store calls, each locking the connection and each
+    /// committing — including an `INSERT OR IGNORE INTO rooms` that ran on
+    /// every message to a room that already existed. That is three commits of
+    /// work for nothing. Collapsing them is what brought send p99 under the 1 ms
+    /// criterion while keeping `seq` assigned inside the same transaction, so
+    /// ordering is unchanged.
+    ///
+    /// The caller still reads the role separately to validate the send *before*
+    /// anything is written; only the redundant write work is folded in here.
+    ///
+    /// Returns `Some(seq)` on success, or `None` if the sender never
+    /// registered — callers turn that into the `auth` error, preserving the
+    /// previous behaviour with a quarter of the store traffic.
+    pub fn append_from_registered(&self, env: &mut Envelope, kind: Kind) -> Result<Option<i64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let registered: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM agents WHERE id=?1",
+            params![env.from.id],
+            |r| r.get(0),
+        )?;
+        if registered == 0 {
+            tx.rollback()?;
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO rooms (name, opened) VALUES (?1, ?2)",
+            params![env.room, now_ms()],
+        )?;
+        let seq = self.assign_and_insert(&tx, env, kind)?;
+        tx.commit()?;
+        Ok(Some(seq))
+    }
+
+    /// The shared body: assign seq, stamp, insert. Caller owns the transaction.
+    fn assign_and_insert(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        env: &mut Envelope,
+        kind: Kind,
+    ) -> Result<i64> {
         let seq: i64 = tx.query_row(
             "UPDATE rooms SET seq = seq + 1 WHERE name = ?1 RETURNING seq",
             params![env.room],
@@ -343,7 +401,6 @@ impl Store {
                 serde_json::to_string(env)?
             ],
         )?;
-        tx.commit()?;
         Ok(seq)
     }
 

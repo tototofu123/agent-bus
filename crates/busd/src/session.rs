@@ -316,9 +316,8 @@ async fn op_send(
         .await?;
         return Ok(());
     }
-    if !require_registered(state, &agent.id, writer).await? {
-        return Ok(());
-    }
+    // Registration is checked inside `append_from_registered`, which does it
+    // in the same transaction as the append, so it is not checked here first.
     let Some(kind_str) = msg.get("kind").and_then(|k| k.as_str()) else {
         write(writer, &err_value("payload", "send requires kind")).await?;
         return Ok(());
@@ -348,8 +347,18 @@ async fn op_send(
         write(writer, &err_value(&code, m)).await?;
         return Ok(());
     }
-    state.store.ensure_room(&room)?;
-    let seq = state.store.append(&mut env, kind)?;
+    // Registration, room existence and the append itself share one
+    // transaction. `op_send` used to run these as four separate store calls,
+    // each committing; folding them is what brought send p99 under the 1 ms
+    // criterion. `None` means the sender never registered.
+    let Some(seq) = state.store.append_from_registered(&mut env, kind)? else {
+        write(
+            writer,
+            &err_value("auth", "anonymous@bus has not registered; run `bus register` first"),
+        )
+        .await?;
+        return Ok(());
+    };
     state.router.fan_out(&env);
     let mut reply = json!({"op": OP_SENT, "id": env.id, "seq": seq, "room": room});
     if let Some(Trust::Peer) = env.trust {

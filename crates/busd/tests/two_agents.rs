@@ -233,6 +233,20 @@ async fn two_agents_one_room_full_flow() -> Result<()> {
         .await?;
     assert_eq!(who["count"].as_i64().unwrap(), 2);
 
+    // -- who with no room: the unscoped listing. This binds no parameter to the
+    // query, which a naive implementation gets wrong ("Wrong number of
+    // parameters passed to query. Got 1, needed 0").
+    let all = hist.op(json!({"op": "who"})).await?;
+    let n = all["agents"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(n >= 2, "unscoped who listed {n} agents, expected at least the two here");
+    assert!(
+        all["agents"]
+            .as_array()
+            .map(|a| a.iter().all(|x| x.get("role").is_some()))
+            .unwrap_or(false),
+        "unscoped who must return a role per agent"
+    );
+
     // -- rooms
     let rooms = hist.op(json!({"op": "rooms"})).await?;
     assert_eq!(rooms["rooms"][0]["name"], "#task:fix-auth");
