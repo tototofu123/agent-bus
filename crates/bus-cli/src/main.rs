@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use proto::{decode_line, encode_line, Agent};
 use serde_json::{json, Value};
 use std::io::Write as _;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
@@ -17,6 +17,12 @@ struct Cli {
     /// daemon port (AGENT_BUS_PORT overrides; default 47113)
     #[arg(long, global = true)]
     port: Option<u16>,
+    /// transport to try first: tcp (default) or pipe
+    #[arg(long, global = true, default_value = "tcp")]
+    transport: String,
+    /// named pipe path when transport is pipe (default \\.\pipe\agent-busd)
+    #[arg(long, global = true)]
+    pipe: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -184,36 +190,150 @@ fn token_path(agent: &str) -> std::path::PathBuf {
     bus_home().join("tokens").join(format!("{sanitized}.token"))
 }
 
-struct Client {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+/// A connected stream: TCP loopback, or a Windows named pipe.
+enum Stream {
+    Tcp(TcpStream),
+    #[cfg(windows)]
+    Pipe(tokio::net::windows::named_pipe::NamedPipeClient),
+}
+
+/// Transport preference, derived once from the CLI flags.
+#[derive(Clone)]
+struct Transport {
+    /// `tcp` (default) or `pipe`.
+    prefer: String,
+    pipe: Option<String>,
+}
+
+impl Transport {
+    fn pipe_path(&self) -> String {
+        self.pipe
+            .clone()
+            .unwrap_or_else(|| r"\\.\pipe\agent-busd".to_string())
+    }
+
+    /// Try the named pipe. Compiles to a failing attempt off Windows.
+    fn try_pipe(&self, attempts: &mut Vec<String>) -> Option<Stream> {
+        #[cfg(windows)]
+        {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(self.pipe_path()) {
+                Ok(cli) => return Some(Stream::Pipe(cli)),
+                Err(e) => attempts.push(format!("named pipe {} ({e})", self.pipe_path())),
+            }
+            None
+        }
+        #[cfg(not(windows))]
+        {
+            attempts.push(format!("named pipe {}", self.pipe_path()));
+            None
+        }
+    }
+
+    /// Connect over the preferred transport, falling back to the other one.
+    ///
+    /// On failure the message names every attempt, so `os error 10061` is never
+    /// the whole story.
+    async fn connect(&self, p: u16) -> Result<Client> {
+        let mut attempts: Vec<String> = Vec::new();
+
+        if self.prefer == "pipe" {
+            if let Some(s) = self.try_pipe(&mut attempts) {
+                return Ok(Client::new(s));
+            }
+        }
+
+        match TcpStream::connect(("127.0.0.1", p)).await {
+            Ok(s) => return Ok(Client::new(Stream::Tcp(s))),
+            Err(e) => attempts.push(format!("tcp 127.0.0.1:{p} ({e})")),
+        }
+
+        if self.prefer != "pipe" {
+            if let Some(s) = self.try_pipe(&mut attempts) {
+                return Ok(Client::new(s));
+            }
+        }
+
+        anyhow::bail!(
+            "connect to agent-busd failed; tried: {}. Is the broker running?",
+            attempts.join("; ")
+        )
+    }
+}
+
+enum Client {
+    /// TCP loopback: two independent halves.
+    Tcp {
+        reader: BufReader<OwnedReadHalf>,
+        writer: OwnedWriteHalf,
+    },
+    /// Named pipe: one duplex handle shared by reads and writes.
+    #[cfg(windows)]
+    Pipe(tokio::net::windows::named_pipe::NamedPipeClient),
 }
 
 impl Client {
-    async fn connect(p: u16) -> Result<Client> {
-        let stream = TcpStream::connect(("127.0.0.1", p))
-            .await
-            .context("connect to agent-busd (is it running?)")?;
-        let (rd, wr) = stream.into_split();
-        Ok(Client {
-            reader: BufReader::new(rd),
-            writer: wr,
-        })
+    fn new(stream: Stream) -> Client {
+        match stream {
+            Stream::Tcp(s) => {
+                let (rd, wr) = s.into_split();
+                Client::Tcp {
+                    reader: BufReader::new(rd),
+                    writer: wr,
+                }
+            }
+            #[cfg(windows)]
+            Stream::Pipe(s) => Client::Pipe(s),
+        }
     }
 
+
     async fn send_raw(&mut self, v: &Value) -> Result<()> {
-        self.writer.write_all(encode_line(v).as_bytes()).await?;
-        self.writer.flush().await?;
-        Ok(())
+        match self {
+            Client::Tcp { writer, .. } => {
+                writer.write_all(encode_line(v).as_bytes()).await?;
+                writer.flush().await?;
+                Ok(())
+            }
+            #[cfg(windows)]
+            Client::Pipe(h) => {
+                use tokio::io::AsyncWriteExt;
+                h.write_all(encode_line(v).as_bytes()).await?;
+                h.flush().await?;
+                Ok(())
+            }
+        }
     }
 
     async fn read_msg(&mut self) -> Result<Value> {
         let mut line = String::new();
-        let n = self.reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(anyhow!("connection closed by busd"));
+        match self {
+            Client::Tcp { reader, .. } => {
+                use tokio::io::AsyncBufReadExt;
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    return Err(anyhow!("connection closed by busd"));
+                }
+            }
+            #[cfg(windows)]
+            Client::Pipe(h) => {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 4096];
+                // A pipe carries no framing of its own; the NDJSON terminator
+                // is the newline, so read until one arrives.
+                loop {
+                    let n = h.read(&mut buf).await?;
+                    if n == 0 {
+                        return Err(anyhow!("connection closed by busd"));
+                    }
+                    line.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if line.contains('\n') {
+                        break;
+                    }
+                }
+            }
         }
-        decode_line(line.trim_end_matches('\n').as_bytes()).map_err(|e| anyhow!("{e}"))
+        let trimmed = line.trim_end_matches('\n');
+        decode_line(trimmed.as_bytes()).map_err(|e| anyhow!("{e}"))
     }
 
     async fn op(&mut self, v: Value) -> Result<Value> {
@@ -250,6 +370,34 @@ impl Client {
 
     async fn bye(&mut self) {
         let _ = self.send_raw(&json!({"op": "bye"})).await;
+    }
+
+    /// Read one more line into `line`, returning how many bytes arrived.
+    /// Used by the streaming commands, which own the connection for a while.
+    async fn read_line_dyn(&mut self, line: &mut String) -> Result<usize> {
+        match self {
+            Client::Tcp { reader, .. } => {
+                use tokio::io::AsyncBufReadExt;
+                Ok(reader.read_line(line).await?)
+            }
+            #[cfg(windows)]
+            Client::Pipe(h) => {
+                use tokio::io::AsyncReadExt;
+                // A pipe carries no framing of its own; read until the NDJSON
+                // newline arrives.
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = h.read(&mut buf).await?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    line.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if line.contains('\n') {
+                        return Ok(line.len());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -305,7 +453,11 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     let p = port(cli.port);
-    let mut c = Client::connect(p).await?;
+    let transport = Transport {
+        prefer: cli.transport.clone(),
+        pipe: cli.pipe.clone(),
+    };
+    let mut c = transport.connect(p).await?;
 
     match cli.cmd {
         Cmd::Register(a) => {
@@ -430,13 +582,13 @@ async fn run(cli: Cli) -> Result<()> {
 
             // Reader runs in its own task so repainting is not gated on
             // whether traffic happens to arrive.
-            let mut reader = c.reader;
+            let mut reader = c;
             let sink = feed.clone();
             let reader_task = tokio::spawn(async move {
                 let mut line = String::new();
                 loop {
                     line.clear();
-                    match reader.read_line(&mut line).await {
+                    match reader.read_line_dyn(&mut line).await {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
@@ -540,7 +692,7 @@ async fn run(cli: Cli) -> Result<()> {
             let mut line = String::new();
             loop {
                 line.clear();
-                let n = c.reader.read_line(&mut line).await?;
+                let n = c.read_line_dyn(&mut line).await?;
                 if n == 0 {
                     break;
                 }

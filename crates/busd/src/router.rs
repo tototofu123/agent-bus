@@ -115,6 +115,8 @@ pub struct Router {
     rate: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// room -> members (mirror of the members table, updated on join/leave)
     members: std::sync::RwLock<HashMap<String, HashSet<String>>>,
+    /// id prefixes whose rate is measured rather than limited
+    exempt: std::sync::RwLock<HashSet<String>>,
 }
 
 impl Default for Router {
@@ -132,12 +134,16 @@ impl Router {
             next_tail_id: std::sync::atomic::AtomicU32::new(1),
             rate: Mutex::new(HashMap::new()),
             members: std::sync::RwLock::new(HashMap::new()),
+            exempt: std::sync::RwLock::new(HashSet::new()),
         }
     }
 
     // -- rate limiting -----------------------------------------------------
 
     pub fn rate_check(&self, agent: &str) -> bool {
+        if self.is_rate_exempt(&self.exempt.read().unwrap(), agent) {
+            return true;
+        }
         let mut rate = self.rate.lock().unwrap();
         let q = rate.entry(agent.to_string()).or_default();
         let now = Instant::now();
@@ -152,6 +158,20 @@ impl Router {
         }
         q.push_back(now);
         true
+    }
+
+    /// Agents whose send rate is being measured rather than governed.
+    ///
+    /// The 60 msg/s limit exists to keep one agent from starving a room, so it
+    /// has to stay off when a bench is measuring what the append path can do.
+    /// Matching is a prefix on a leading `~`-free id, e.g. `bench:` exempts
+    /// `bench:w0`.
+    pub fn exempt_from_rate_limit(&self, prefix: &str) {
+        self.exempt.write().unwrap().insert(prefix.to_string());
+    }
+
+    fn is_rate_exempt(&self, prefixes: &HashSet<String>, agent: &str) -> bool {
+        prefixes.iter().any(|p| agent.starts_with(p.as_str()))
     }
 
     // -- inboxes -------------------------------------------------------------

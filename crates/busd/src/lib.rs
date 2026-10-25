@@ -135,6 +135,32 @@ pub async fn serve(mut listener: TransportListener, state: Arc<AppState>) -> Res
     }
 }
 
+/// Serve one named pipe: accept, hand off, and immediately create the next
+/// server instance so the accept loop never has a gap.
+#[cfg(windows)]
+pub async fn serve_named_pipe(
+    pipe_name: String,
+    mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+    state: Arc<AppState>,
+) {
+    loop {
+        if let Err(e) = server.connect().await {
+            eprintln!("busd: pipe connect error: {e}");
+            return;
+        }
+        let next = tokio::net::windows::named_pipe::ServerOptions::new()
+            .create(&pipe_name)
+            .expect("recreate named pipe server");
+        let connected = std::mem::replace(&mut server, next);
+        let st = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = session::handle_conn(TransportStream::NamedPipe(connected), st).await {
+                eprintln!("busd: pipe conn closed: {e}");
+            }
+        });
+    }
+}
+
 pub struct Config {
     pub port: u16,
     pub db_path: std::path::PathBuf,
@@ -171,34 +197,58 @@ fn write_pid_file(path: &std::path::Path, pid: u32, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Create the transport listener (named pipe on Windows, TCP everywhere).
+/// Create the transport listener.
+///
+/// TCP binds **first** and unconditionally: the bind is the lock that keeps a
+/// second broker from serving a shared SQLite file (see `port_in_use`). On
+/// Windows a named pipe binds *afterwards* as an additional face — not a
+/// fallback — so pipe clients and TCP clients both reach the one broker.
+///
+/// Only one transport is returned by this function; the pipe, when it binds,
+/// is served on a spawned task against the same state.
 async fn create_listener(cfg: &Config) -> Result<TransportListener> {
-    // On Windows, try named pipe first
-    #[cfg(windows)]
-    {
-        let pipe_path = cfg.pipe_path.clone().unwrap_or_else(|| r"\\.\pipe\agent-busd".to_string());
-        // Use first_pipe_instance to ensure we're the first (or only) server
-        match tokio::net::windows::named_pipe::ServerOptions::new()
-            .first_pipe_instance(true)
-            .create(&pipe_path)
-        {
-            Ok(server) => {
-                println!("agent-busd: listening on named pipe {}", pipe_path);
-                return Ok(TransportListener::NamedPipe {
-                    pipe_name: pipe_path,
-                    server,
-                });
-            }
-            Err(e) => {
-                eprintln!("agent-busd: named pipe failed ({}), falling back to TCP", e);
-            }
-        }
-    }
-
-    // TCP fallback (always available)
-    let listener = TcpListener::bind(("127.0.0.1", cfg.port)).await?;
+    let listener = TcpListener::bind(("127.0.0.1", cfg.port))
+        .await
+        .map_err(|e| {
+            let owner = pid_from_file(&cfg.pid_file).map(|p| format!(" (pid {p})")).unwrap_or_default();
+            anyhow::anyhow!(
+                "agent-busd: already running on port {}{owner} -- {e}",
+                cfg.port
+            )
+        })?;
     println!("agent-busd: listening on TCP {}", listener.local_addr()?);
     Ok(TransportListener::Tcp(listener))
+}
+
+/// Try to open the named pipe as an *additional* listener, to be served
+/// alongside TCP. Returns `None` when the pipe cannot be created (or on
+/// non-Windows), having explained why on stderr.
+#[cfg(windows)]
+async fn pipe_listener(cfg: &Config) -> Option<(String, tokio::net::windows::named_pipe::NamedPipeServer)> {
+    let pipe_path = cfg
+        .pipe_path
+        .clone()
+        .unwrap_or_else(|| r"\\.\pipe\agent-busd".to_string());
+    // `first_pipe_instance` still guards against two brokers on one machine
+    // both claiming this pipe path.
+    match tokio::net::windows::named_pipe::ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_path)
+    {
+        Ok(server) => {
+            println!("agent-busd: listening on named pipe {}", pipe_path);
+            Some((pipe_path, server))
+        }
+        Err(e) => {
+            eprintln!("agent-busd: named pipe {} unavailable ({e}); TCP only", pipe_path);
+            None
+        }
+    }
+}
+
+#[cfg(not(windows))]
+async fn pipe_listener(_cfg: &Config) -> Option<(String, ())> {
+    None
 }
 
 /// Bind transport, open the store, serve until stopped.
@@ -206,8 +256,17 @@ async fn create_listener(cfg: &Config) -> Result<TransportListener> {
 /// Starting an already-running broker is a no-op rather than an error, so
 /// double-clicking the launcher twice cannot spawn a rival writer.
 pub async fn run(cfg: Config) -> Result<()> {
-    // Create listener (named pipe on Windows, TCP fallback)
-    let listener = create_listener(&cfg).await?;
+    // TCP binds first: the bind is the lock. A second broker over the same
+    // database detects it here instead of becoming a second writer (issue #1).
+    let listener = match create_listener(&cfg).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Documented contract: a double-start is a no-op, not a failure.
+            println!("{e}");
+            eprintln!("{e}");
+            return Ok(());
+        }
+    };
 
     let store = store::Store::open(&cfg.db_path)?;
     let state = Arc::new(AppState::new(store));
@@ -223,6 +282,18 @@ pub async fn run(cfg: Config) -> Result<()> {
         cfg.db_path.display(),
         pid
     );
+
+    // The named pipe, when available, is served alongside TCP against the same
+    // state, so both faces reach the one broker. This never fails the start.
+    #[cfg(windows)]
+    {
+        if let Some((pipe_name, server)) = pipe_listener(&cfg).await {
+            let st = state.clone();
+            tokio::spawn(async move {
+                serve_named_pipe(pipe_name, server, st).await;
+            });
+        }
+    }
 
     let result = tokio::select! {
         r = serve(listener, state) => r,

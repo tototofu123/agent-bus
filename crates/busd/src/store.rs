@@ -191,6 +191,8 @@ impl Store {
 
     pub fn who(&self, room: Option<&str>) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
+        // The room takes one parameter; the unscoped listing takes none, so the
+        // two branches must bind different argument lists.
         let sql = match room {
             Some(_) => {
                 "SELECT a.id, a.harness, a.model, a.last_seen, a.role FROM agents a
@@ -199,7 +201,7 @@ impl Store {
             None => "SELECT id, harness, model, last_seen, role FROM agents ORDER BY id",
         };
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params![room], |r| {
+        let row = |r: &rusqlite::Row| -> rusqlite::Result<serde_json::Value> {
             Ok(serde_json::json!({
                 "id": r.get::<_, String>(0)?,
                 "harness": r.get::<_, String>(1)?,
@@ -207,8 +209,18 @@ impl Store {
                 "last_seen_ms": r.get::<_, i64>(3)?,
                 "role": r.get::<_, String>(4)?,
             }))
-        })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        };
+        let rows = match room {
+            Some(room) => {
+                let rows = stmt.query_map(params![room], row)?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
+            None => {
+                let rows = stmt.query_map([], row)?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
+        };
+        Ok(rows)
     }
 
     // -- rooms / membership -------------------------------------------------
