@@ -24,11 +24,11 @@ Every agentic harness today is an island. Claude Code, Codex CLI, Gemini CLI, op
 
 ## Status
 
-The Phase 1 core is built and tested: the daemon, the store, the sequencer, the role floors, and the CLI all work end to end. What is not done is the evidence — the exit criteria are load and chaos gates (latency, throughput, crash safety, replay, backpressure) that have not been run yet, so Phase 1 is not finished.
+The Phase 1 core is built and tested, and the exit gates have now been run at their stated criteria. Six pass: ordering (8 writers × 10k, gap-free), latency (p99 0.49 ms < 1 ms), replay (50k < 2 s), backpressure (100k chat + 100 task), crash safety (10k-message storm), and the rate limit. Throughput fails: ~8.7k msg/s against the 50k criterion, which is the append path (one fsync'd transaction per message under the store lock) rather than the transport or the limiter. Phase 1 is not closed until that number moves, and the gate is left failing rather than relaxed.
 
 | Phase | Delivers | Status |
 |---|---|---|
-| [1 — Broker + CLI + rooms](docs/phases/phase-1-broker-cli-rooms.md) | `agent-busd`, SQLite, TCP loopback transport, `bus send/recv/tail/who/history` | in progress — core done, perf/chaos gates outstanding |
+| [1 — Broker + CLI + rooms](docs/phases/phase-1-broker-cli-rooms.md) | `agent-busd`, SQLite, TCP + named pipe, `bus send/recv/tail/who/history` | in progress — 6 of 7 exit gates pass at criteria; throughput fails at ~8.7k msg/s vs 50k |
 | [2 — Local IP surface + presence](docs/phases/phase-2-localip-presence.md) | localhost WS + REST, auto-join hooks, mentions, threads | planned |
 | [3 — Claims, handoff, artifacts](docs/phases/phase-3-claims-handoff-artifacts.md) | file-lock registry, `task.*`, artifact store, context compaction | planned |
 | [4 — MCP face + human surfaces + policy](docs/phases/phase-4-mcp-human-policy.md) | `bus-mcp` (stdio + Streamable HTTP), TUI, web, approval gates | planned |
@@ -84,7 +84,8 @@ The state lives in `%USERPROFILE%\.agent-bus` (`history.sqlite`, `busd.pid`, `to
 Two properties are enforced rather than assumed:
 
 - **One broker per machine.** The port is the lock. Starting a second one is a no-op with a message, not a crash — two brokers over one SQLite file would fight over `seq`.
-- **Stop only ever kills its own process.** The panel records the pid at bind time and checks the process is actually named `busd` before killing it, so a recycled pid can't be hit.
+- **Stop only ever kills its own process.** A recorded pid is not a claim — pids recycle. `busd --status`, the double-start no-op message, and the panel's Stop button all resolve the pid through the same check (the pid exists **and** its image name is `busd`) before acting on it, so a recycled pid can't be hit. A pidfile naming a dead, recycled, or unparseable pid reads `pid unknown`, never the broker.
+- **Two transports, one broker.** On Windows the broker serves both TCP loopback **and** the named pipe `\\.\pipe\agent-busd`. TCP stays the default and binds first — the bind is the lock that keeps a second broker from writing the same database — and the pipe is an additional face, not a fallback. `bus --transport pipe` prefers the pipe and falls back to TCP; if neither answers, the error names both attempts.
 
 `install.ps1` also sweeps any autostart entry that points at `busd` — Run key, Startup folder, or scheduled task — so the no-autostart rule survives a previous install.
 
@@ -119,7 +120,7 @@ agent-bus/
 ├── crates/
 │   ├── proto/              ← envelope, kinds, NDJSON framing, role floors, tokens
 │   ├── busd/               ← the broker: session state machine, router, SQLite store
-│   └── bus-cli/            ← `bus`: one-shot commands over TCP loopback NDJSON
+│   └── bus-cli/            ← `bus`: one-shot commands over NDJSON (TCP + named pipe)
 ├── tools/launcher/         ← Windows desktop control panel + installer
 ├── docs/
 │   ├── protocol.md         ← NDJSON wire protocol, envelope, kind contracts

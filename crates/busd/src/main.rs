@@ -47,13 +47,14 @@ fn main() -> Result<()> {
     // Query mode for the launcher: exit 0 while the broker is up, 1 otherwise,
     // so a script can branch on it directly.
     if status {
-        if rt.block_on(busd::port_in_use(port)) {
-            let pid = busd::pid_from_file(&pid_path)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".into());
-            println!("running port={port} pid={pid}");
-        } else {
-            println!("stopped port={port}");
+        let listening = rt.block_on(busd::port_in_use(port));
+        // A pid only counts if it is alive AND is a broker, so a recycled pid
+        // is reported as unknown rather than as the broker (issue #5).
+        let live = busd::live_broker(&pid_path);
+        match (listening, live) {
+            (true, Some(p)) => println!("running port={port} pid={}", p.pid),
+            (true, None) => println!("running port={port} pid=unknown"),
+            (false, _) => println!("stopped port={port}"),
         }
         return Ok(());
     }

@@ -189,6 +189,78 @@ pub fn pid_from_file(path: &std::path::Path) -> Option<u32> {
         .ok()
 }
 
+/// A broker process that a caller can safely act on.
+///
+/// A recorded pid is not a claim: pids recycle. This is the raw datum plus the
+/// check that turns it into one, so `--status`, the control panel's Stop
+/// button, and the double-start no-op message all agree on what "the broker"
+/// means instead of each guessing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerProcess {
+    pub pid: u32,
+    pub port: u16,
+}
+
+impl BrokerProcess {
+    /// Does this pid exist AND is it a broker process?
+    ///
+    /// Without the name check, a recycled pid pointing at any other program
+    /// would let a launcher kill a stranger on the user's behalf.
+    pub fn is_live(&self) -> bool {
+        process_is_named(self.pid, PROCESS_NAME)
+    }
+}
+
+/// Image name the broker runs under, without an extension, for comparison.
+const PROCESS_NAME: &str = "busd";
+
+/// Is the process with this pid running under the given image name?
+///
+/// `tasklist /FI "PID eq n"` is the probe: it needs no extra dependency, and
+/// the same filter the control panel already uses. A missing or inaccessible
+/// process answers with no data row, which reads as "not live".
+#[cfg(windows)]
+fn process_is_named(pid: u32, name: &str) -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+    let Ok(out) = out else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // A matching row looks like: "busd.exe","1234","Console","1","10,000 K".
+    text.lines().any(|line| {
+        let first = line.split(',').next().unwrap_or("").trim_matches('"');
+        let stem = first.trim_end_matches(".exe");
+        stem.eq_ignore_ascii_case(name)
+    })
+}
+
+#[cfg(unix)]
+fn process_is_named(pid: u32, name: &str) -> bool {
+    // /proc is the same idea as the Windows probe, without the extra
+    // dependency: read the comm file and compare the image name.
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|c| c.trim().eq_ignore_ascii_case(name))
+        .unwrap_or(false)
+}
+
+/// Resolve the pid file into a live claim, or `None` if it is stale or names a
+/// different process. `None` means "do not touch this pid", not "nothing runs".
+pub fn live_broker(path: &std::path::Path) -> Option<BrokerProcess> {
+    let pid = pid_from_file(path)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let port = text
+        .lines()
+        .nth(1)
+        .and_then(|l| l.trim().parse::<u16>().ok())?;
+    let proc = BrokerProcess { pid, port };
+    proc.is_live().then_some(proc)
+}
+
 fn write_pid_file(path: &std::path::Path, pid: u32, port: u16) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -210,7 +282,10 @@ async fn create_listener(cfg: &Config) -> Result<TransportListener> {
     let listener = TcpListener::bind(("127.0.0.1", cfg.port))
         .await
         .map_err(|e| {
-            let owner = pid_from_file(&cfg.pid_file).map(|p| format!(" (pid {p})")).unwrap_or_default();
+            // Name the live owner if we can verify it, never a bare recorded pid.
+            let owner = live_broker(&cfg.pid_file)
+                .map(|p| format!(" (pid {})", p.pid))
+                .unwrap_or_default();
             anyhow::anyhow!(
                 "agent-busd: already running on port {}{owner} -- {e}",
                 cfg.port
@@ -303,8 +378,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     };
 
-    // Only remove the file if it is still ours, so a restart that has already
-    // claimed the port does not lose its own pid.
+    // Only remove the file if it still names this process, so a restart that
+    // has already claimed the port does not lose its own pid.
     if pid_from_file(&cfg.pid_file) == Some(pid) {
         let _ = std::fs::remove_file(&cfg.pid_file);
     }

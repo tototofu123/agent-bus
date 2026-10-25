@@ -38,7 +38,7 @@
 
 | # | Transport | Phase | Purpose |
 |---|---|---|---|
-| 1 | Unix socket / Windows named pipe (+ TCP loopback fallback) | 1 | primary local transport, NDJSON lines |
+| 1 | TCP loopback (default, and the bind lock) + Windows named pipe as an additional face | 1 | local transports, NDJSON lines. On Windows both serve the same broker; `bus --transport pipe` prefers the pipe |
 | 2 | `bus` CLI over that transport | 1 | universal adapter — any harness that can run a shell |
 | 3 | localhost WebSocket + REST (`ws://127.0.0.1:47114/ws`) | 2 | browsers, WASM, curl-able history |
 | 4 | MCP server (`bus-mcp`, stdio + Streamable HTTP via `rmcp`) | 4 | native integration for MCP harnesses |

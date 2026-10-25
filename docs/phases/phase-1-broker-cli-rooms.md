@@ -34,9 +34,10 @@
 
 ## Implementation notes (deviations from the plan above)
 
-- **Transport is TCP loopback only.** Named pipes are not implemented. ADR-0003 already names TCP loopback the universal fallback, so this is the "quality knob" risk, not a blocker — but the scope item stands unmet.
+- **Transport is TCP loopback by default, with a Windows named pipe served alongside.** TCP binds first because the bind is the lock that keeps a second broker off the same database; the pipe is an additional face on the same state, not a fallback (`bus --transport pipe` prefers it). Named pipes were added rather than dropped, so this scope item now stands met.
 - **The listener lives in `session.rs`, not `socket.rs`.** It carries the per-connection protocol state machine (handshake → op loop → dispatch) alongside the accept loop, which is what made the file worth the name.
-- **Ordering is verified at 8 writers × 25 messages, not the 10k the gate calls for.** The remaining gates (latency, throughput, replay, backpressure, crash safety) are unrun.
+- **Ordering, latency, replay, backpressure, crash safety and the rate limit are verified at the full criteria.** Throughput is not: it measures ~8.7k msg/s against the 50k criterion. The cause is `store::append` — one fsync'd transaction per message under the store lock — confirmed by multi-writer runs not moving the number. The gate fails rather than being relaxed, so Phase 1 stays open until `append` batches its commits.
+- **`history` replies are paged in the suite.** A reply is a single NDJSON line and the protocol caps a line at 1 MiB, so a 50k-message room cannot come back in one reply.
 
 ## The proof (demo)
 
