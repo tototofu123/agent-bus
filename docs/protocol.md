@@ -112,6 +112,27 @@ Rejection is typed and public: a `protocol`-role agent sending `task.claim` gets
 - **Ephemeral vs durable:** `chat`/`status` TTL'd (default 24 h); `task.*`/`artifact`/`policy` durable until room close. `bus gc --older-than 7d` sweeps ephemerals.
 - **Rate limit:** 60 msg/s per agent; per-connection queue caps.
 
+## `send_batch` — many envelopes, one commit
+
+```jsonc
+→ {"op":"send_batch","room":"#task:fix-auth","messages":[
+    {"kind":"chat","text":"step 1 done"},
+    {"kind":"chat","text":"step 2 done"}
+  ]}
+← {"op":"sent_batch","ids":["01J…","01J…"],"seqs":[41,42],"room":"#task:fix-auth","count":2}
+```
+
+Same fields inside each `messages[]` entry as a single `send`. The broker appends the whole batch in **one transaction**, so a room being driven hard pays one commit for N messages instead of N — the difference between ~8k and ~30k msg/s in the throughput gate.
+
+Rules:
+
+- **Batching is not a rate-limit bypass.** The 60 msg/s policy is charged per message, so an N-message batch consumes N slots.
+- **Width is bounded by the line cap.** A batch is one NDJSON line, so `MAX_BATCH` alone is the wrong bound: 256 messages of a 1 KB payload is a 276 KB line. Split by the line budget, not by the frame cap.
+- **Validation is all-or-nothing.** Every envelope is built and validated before the first write, so a frame that fails to parse never leaves a half-committed batch.
+- **The durability bound is one frame.** A `kill -9` can lose the messages inside an open transaction, so at most one batch is lost. The crash-loss gate asserts that bound.
+
+`send` remains the path where the reply has to mean "survives a crash".
+
 ## Message flow (two agents, one file)
 
 ```

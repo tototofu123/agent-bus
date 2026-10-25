@@ -312,11 +312,12 @@ impl Store {
     /// rule), and the correctness gates rely on it: a message either survives a
     /// crash or never existed, with no in-between state.
     ///
-    /// Batching several inserts into one commit was tried and removed: the send
-    /// path commits each message as it is accepted, so a batch there held
-    /// exactly one message and measured 6,139 msg/s against 8,759 for the direct
-    /// path — pure overhead. Real batching needs the client to send many
-    /// envelopes in one frame, which is a protocol change, not a store change.
+    /// Batch-of-N amortisation lives in `append_batch`, driven by the
+    /// `send_batch` protocol op: folding several inserts into a *per-message*
+    /// commit was measured at 6,139 msg/s against 8,759 for the direct path,
+    /// because the send path commits each message as it is accepted, so such a
+    /// batch always held exactly one message. The amortisation needs the client
+    /// to send many envelopes in one frame.
     pub fn append(&self, env: &mut Envelope, kind: Kind) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;

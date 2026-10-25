@@ -623,7 +623,7 @@ async fn bench_batch_crash_loss_bounded() -> anyhow::Result<()> {
             "payload": json!({"data": "x".repeat(1024)})
         })],
     }))?;
-    let per_frame = (proto::MAX_LINE_BYTES / probe.len()).max(1).min(proto::MAX_BATCH);
+    let per_frame = (proto::MAX_LINE_BYTES / probe.len()).clamp(1, proto::MAX_BATCH);
     println!(
         "batch frame width: {per_frame} messages ({} bytes each, cap {})",
         probe.len(),

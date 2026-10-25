@@ -24,7 +24,7 @@ Every agentic harness today is an island. Claude Code, Codex CLI, Gemini CLI, op
 
 ## Status
 
-The Phase 1 core is built and tested, and the exit gates have now been run at their stated criteria. Six pass: ordering (8 writers × 10k, gap-free), latency (send→recv p99 < 1 ms), replay (50k < 2 s), backpressure (100k chat + 100 task), crash safety (10k-message storm), and the rate limit. Throughput fails: ~7-8k msg/s against the 50k criterion, which is the store's own ceiling measured with no sockets (one commit per message under the store lock) — the transport and the limiter are not the cause. Phase 1 is not closed until that number moves, and the gate is left failing rather than relaxed.
+The Phase 1 core is built and tested, and the exit gates have now been run at their stated criteria. Seven pass: ordering (8 writers × 10k, gap-free), latency (send→recv p99 < 1 ms), replay (50k < 2 s), backpressure (100k chat + 100 task), crash safety (10k-message storm), the batch crash-loss bound, and the rate limit. Throughput fails: ~30k msg/s against the 50k criterion, up 4.4× from ~7k once `send_batch` let the broker amortise one commit across many envelopes. The remaining gap is per-envelope work in the session layer, not the transport or the limiter.
 
 Two measurement notes that mattered more than the numbers: the send path originally did its registration check, role lookup and room ensure as four separate store calls, each with its own commit — folding them into one transaction is what brought send p99 inside the criterion. And latency distributes as ~99% under 0.25 ms with a ~1% band around 10 ms, so p99 sits on a handful of samples and moves run to run; the bench prints a histogram because a single p99 figure hides that.
 
