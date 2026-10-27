@@ -37,6 +37,8 @@ enum Cmd {
     Leave(RoomArgs),
     /// Send a typed message
     Send(SendArgs),
+    /// Send many messages in one frame (one commit on the broker)
+    SendBatch(SendBatchArgs),
     /// Block until a message for me arrives (this is push, as far as you can tell)
     Recv(RecvArgs),
     /// Live-stream room traffic until Ctrl-C
@@ -89,6 +91,17 @@ struct SendArgs {
     thread: Option<String>,
     #[arg(long)]
     reply_to: Option<String>,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct SendBatchArgs {
+    #[arg(long)]
+    room: String,
+    /// path to a JSON array of message bodies, or `-` for stdin
+    #[arg(long)]
+    file: String,
     #[arg(long)]
     agent: Option<String>,
 }
@@ -164,6 +177,18 @@ fn default_agent(explicit: Option<String>) -> String {
     explicit
         .or_else(|| std::env::var("AGENT_ID").ok())
         .unwrap_or_else(|| "anonymous@bus".into())
+}
+
+/// Name the JSON shape actually handed to us, for error messages.
+fn messages_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 fn bus_home() -> std::path::PathBuf {
@@ -543,6 +568,44 @@ async fn run(cli: Cli) -> Result<()> {
                 "sent {} seq={}",
                 reply.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
                 reply.get("seq").and_then(|s| s.as_i64()).unwrap_or(0)
+            );
+        }
+        Cmd::SendBatch(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+
+            // Message bodies come from a file or stdin, so a batch is not
+            // limited by command-line length.
+            let raw = if a.file == "-" {
+                use std::io::Read as _;
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s).context("read stdin")?;
+                s
+            } else {
+                std::fs::read_to_string(&a.file)
+                    .with_context(|| format!("read {}", a.file))?
+            };
+            let messages: Value = serde_json::from_str(&raw)
+                .context("batch file must be a JSON array of message objects")?;
+            if !messages.is_array() {
+                anyhow::bail!("batch file must be a JSON array, got {}", messages_kind(&messages));
+            }
+            if messages.as_array().map(|a| a.len()).unwrap_or(0) == 0 {
+                anyhow::bail!("batch file has no messages");
+            }
+
+            // A frame is one NDJSON line, so it must fit the protocol's cap.
+            // Split rather than let the broker reject the whole frame.
+            let frame = json!({"op": "send_batch", "room": a.room, "messages": messages});
+            let reply = c.op(frame).await?;
+            c.bye().await;
+            println!(
+                "sent_batch {} messages, seqs {}..{}",
+                reply.get("count").and_then(|n| n.as_u64()).unwrap_or(0),
+                reply.get("seqs").and_then(|s| s.as_array()).and_then(|s| s.first()).and_then(|n| n.as_i64()).unwrap_or(0),
+                reply.get("seqs").and_then(|s| s.as_array()).and_then(|s| s.last()).and_then(|n| n.as_i64()).unwrap_or(0),
             );
         }
         Cmd::Recv(a) => {

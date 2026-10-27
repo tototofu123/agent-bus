@@ -22,16 +22,17 @@ Five phases, each ending in a working, demonstrable system. **No phase starts un
 
 - [x] Idea + deep dive (ideas repo 029)
 - [x] This repo: protocol spec, architecture, phased plan, ADRs
-- [~] **Phase 1 — gates run at criteria; one fails**
+- [~] **Phase 1 — gates run at criteria; throughput still fails**
   - [x] `proto` (envelope, kinds, NDJSON framing with line cap, role floors, tokens) + 11 unit tests
   - [x] `busd` store: WAL migrations, single-writer sequencer, cursor replay
   - [x] `busd` session state machine + router: fan-out, drop policy, 60 msg/s per agent
   - [x] `bus` CLI: register/join/leave/send/recv/tail/who/history, TCP + named pipe
-  - [x] Exit gates run at their stated criteria: ordering (8×10k gap-free), latency p99 0.49 ms, replay 50k in 0.35 s, backpressure 100k+100, crash safety 10k storm, rate limit typed
-  - [ ] **Throughput fails: ~8.7k msg/s vs the 50k criterion.** `store::append` does one fsync'd transaction per message; fixing it means batching commits, a durability tradeoff. Gate left failing, not relaxed.
+  - [x] `send_batch` protocol op: N envelopes in one frame, one commit (7k → ~31k msg/s)
+  - [x] Exit gates run at their stated criteria: ordering (8×10k gap-free), latency p99 0.49 ms, replay 50k in 0.35 s, backpressure 100k+100, crash safety 10k storm, rate limit typed, framing regression fixed
+  - [ ] **Throughput fails: ~31k msg/s vs the 50k criterion.** Remaining cost is per-envelope work in the session layer (frame parse, envelope construction, fan-out clone), not the transport or the limiter. Gate left failing, not relaxed.
 - [ ] Phase 2
 - [ ] Phase 3
 - [ ] Phase 4
 - [ ] Phase 5
 
-Phase 1 is not closed until those gates pass. Ordering is covered (8 writers, gap-free), but at 200 messages rather than the 10k the criteria call for.
+Phase 1 is not closed until the throughput gate passes.
