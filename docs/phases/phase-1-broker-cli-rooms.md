@@ -81,7 +81,14 @@ cargo test --release --test phase1_gates -- --nocapture --test-threads=1
 (Get-CimInstance Win32_Processor).LoadPercentage
 ```
 
-Current standing: 7 of the 8 tests pass. Throughput is the one that does not — ~20–31k msg/s against the 50k criterion, and the ceiling is the session layer's per-envelope work (frame parse, envelope construction, fan-out's per-member clone), not the transport and not the rate limiter.
+Current standing: 7 of the 8 tests pass. Throughput is the one that does not — ~20–31k msg/s against the 50k criterion.
+
+That criterion is not reachable on this machine, and the reason is measured rather than argued: `store::append_batch` on its own — no sockets, no framing, no fan-out, envelopes pre-built outside the timed region — tops out at **~26k msg/s**, and that reading was taken while the box also ran local inference. One commit per batch through SQLite is the floor of the whole stack, so the full path cannot exceed it. The `send_batch` work took the gate from ~7k to ~31k by reaching that floor; nothing further closes a gap whose cause is the store.
+
+Two things are worth separating when this is revisited:
+
+- **A spec decision.** If the criterion is revised, it should name what a local bus actually needs rather than a number chosen before the stack existed. Phase 2's usage (a handful of agents, human-scale traffic) does not sit anywhere near 20k msg/s.
+- **An engineering option, if the number is ever genuinely required.** Batched commits are already in place; what is left is a different durability contract — a WAL group-commit that fsyncs once per batch instead of per commit, which raises the crash-loss bound from one frame to one fsync interval. That trades `kill -9` safety for throughput on purpose, and is not a change to make for a number nobody is waiting on.
 
 ## Risks
 
