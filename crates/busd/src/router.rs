@@ -287,12 +287,19 @@ impl Router {
 }
 
 /// Validation shared by every `send` path.
+///
+/// `human` is separate from `role` on purpose: a person is not a model, so
+/// role floors do not apply, but a human surface is also the only sender that
+/// may emit `policy`. Broker-emitted kinds (`presence`, `task.grant`,
+/// `task.deny`) stay reserved even for a human.
 pub fn validate_send(
     env: &Envelope,
     kind: Kind,
     role: proto::Role,
+    human: bool,
 ) -> Result<(), (String, String)> {
-    if !role.allowed(&kind) {
+    let allowed = role.allowed(&kind) || (human && kind == proto::Kind::Policy);
+    if !allowed {
         return Err((
             "role".into(),
             format!(
@@ -311,4 +318,41 @@ pub fn validate_send(
         return Err(("payload".into(), e.to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proto::{Agent, Envelope};
+
+    fn env(kind: Kind) -> Envelope {
+        Envelope::new(
+            "#repo:test",
+            Agent {
+                id: "peer@test".into(),
+                harness: "test".into(),
+                model: Some("llama-3-70b".into()),
+                session: None,
+                cwd: None,
+                caps: vec![],
+            },
+            kind,
+        )
+    }
+
+    #[test]
+    fn policy_needs_a_human_even_for_a_peer() {
+        let mut e = env(Kind::Policy);
+        e.payload = Some(serde_json::json!({"deny": ["src/db/**"]}));
+        assert!(validate_send(&e, Kind::Policy, proto::Role::Peer, false).is_err());
+        assert!(validate_send(&e, Kind::Policy, proto::Role::Peer, true).is_ok());
+    }
+
+    #[test]
+    fn human_cannot_emit_broker_kinds() {
+        let e = env(Kind::Presence);
+        assert!(validate_send(&e, Kind::Presence, proto::Role::Peer, true).is_err());
+        let e = env(Kind::TaskGrant);
+        assert!(validate_send(&e, Kind::TaskGrant, proto::Role::Peer, true).is_err());
+    }
 }

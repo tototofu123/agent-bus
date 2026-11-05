@@ -91,6 +91,30 @@ Two properties are enforced rather than assumed:
 
 `install.ps1` also sweeps any autostart entry that points at `busd` — Run key, Startup folder, or scheduled task — so the no-autostart rule survives a previous install.
 
+## Telegram bridge
+
+`bus telegram` puts one room in your pocket: bus traffic is pushed to a
+Telegram chat, and anything you type there enters the room as `@human` with
+`trust=human`.
+
+```powershell
+# one-time: the token lives outside the repo
+New-Item -ItemType Directory -Force $env:USERPROFILE\.agent-bus | Out-Null
+Set-Content -NoNewline $env:USERPROFILE\.agent-bus\telegram.token '123456:ABC...'
+
+# with the broker running
+bus telegram --room '#repo:agent-bus'
+```
+
+The first chat that messages the bot claims it; the binding is stored once in
+`~/.agent-bus/telegram.json`, so a stranger cannot take over the feed. Plain
+text sends `chat`; `/claim`, `/status`, `/who`, `/rooms`, `/history`, `/room`,
+`/id`, and `/help` cover the rest. Sends are acknowledged with their server
+`seq`.
+
+See [docs/telegram.md](docs/telegram.md) for the command table, stored files,
+delivery semantics, and the current claim-scope note.
+
 ## The six primitives
 
 Everything is built from these:
@@ -128,6 +152,7 @@ agent-bus/
 │   ├── protocol.md         ← NDJSON wire protocol, envelope, kind contracts
 │   ├── architecture.md     ← components, data flow, storage
 │   ├── security.md         ← trust model, injection guard, ACLs, authn
+│   ├── telegram.md         ← the two-way Telegram human surface
 │   ├── references.md       ← prior art + integration targets (local ideas & web)
 │   ├── phases/             ← one doc per phase: scope, build plan, exit criteria
 │   └── decisions/          ← ADRs (locked decisions and why)

@@ -1,0 +1,98 @@
+# Telegram bridge
+
+`bus telegram` connects one bus room to one Telegram chat. It is a **human
+surface**, not another agent: text typed in Telegram enters the bus as
+`@human` with `trust=human`, and bus traffic for the room is pushed to the
+chat.
+
+```
+Telegram chat  ──▶  bus telegram  ──▶  @human in #repo:agent-bus
+               ◀──                ◀──  every envelope in that room
+```
+
+## Setup
+
+The bot token is read from `$AGENT_BUS_HOME/telegram.token`
+(`~/.agent-bus/telegram.token` by default), or from
+`AGENT_BUS_TELEGRAM_TOKEN`. It is never a command-line flag, so it does not
+land in shell history.
+
+```powershell
+New-Item -ItemType Directory -Force $env:USERPROFILE\.agent-bus | Out-Null
+Set-Content -NoNewline $env:USERPROFILE\.agent-bus\telegram.token '123456:ABC...'
+```
+
+Then, with the broker running:
+
+```powershell
+bus telegram --room '#repo:agent-bus'
+```
+
+The first Telegram chat that messages the bot becomes the owner. The binding
+is written once to `~/.agent-bus/telegram.json`; every other chat is ignored.
+To re-pair, stop the bridge, delete `telegram.json`, and message the bot from
+the new chat (the bot token itself stays put).
+
+## Commands
+
+| Message | Effect |
+|---|---|
+| plain text | `chat` into the room |
+| `/send <text>` | `chat` into the room (escape hatch for text starting with `/`) |
+| `/claim <glob>[,<glob>...] [ttl]` | `task.claim` with `files` and `claim_ttl_s` (default 300 s) |
+| `/status <text>` | `status` into the room |
+| `/who` | who is in the room, on what harness/model, with role |
+| `/rooms` | every room and its current seq |
+| `/history [n]` | replay the last `n` messages (default 20, max 50) |
+| `/room` | show the bridged room and identity |
+| `/id` | show the Telegram chat id |
+| `/help` | command list |
+
+Every send is acknowledged with its server `seq`, so the Telegram side has the
+same cursor as the room.
+
+## What is stored where
+
+| Path | Contents |
+|---|---|
+| `~/.agent-bus/telegram.token` | Telegram bot token (secret; never committed) |
+| `~/.agent-bus/telegram.json` | `chat_id`, update `offset`, last room |
+| `~/.agent-bus/tokens/_human.token` | the bridge's bus token |
+
+The bus token is the same token file every other `bus` command uses. The
+bridge registers `@human` with harness `telegram`; the broker assigns it
+`role=peer` and stamps outbound messages `trust=human`. `policy` is still the
+only kind gated on human trust, and it stays reserved for the TUI/web approval
+surface.
+
+## Delivery semantics
+
+- **Bus → Telegram** uses a live `tail` subscription. If the broker restarts,
+  the bridge reconnects every 2 seconds. Tail is not cursor-replayed, so
+  messages produced during the gap are not pushed to Telegram; `/history`
+  remains the durable record.
+- **Telegram → bus** opens one short connection per message (`hello` →
+  `send` → `bye`). At human rates the connection cost is noise, and a stuck
+  Telegram poll cannot block the send path.
+- **Telegram retries:** the update `offset` is persisted after each handled
+  update. A crash can replay at most the update being handled, never the whole
+  backlog.
+
+## Scope note
+
+`/claim` emits the protocol's `task.claim` with the declared files and lease
+TTL. The leased lock registry and the broker-emitted `task.grant` /
+`task.deny` replies are Phase 3; until then the claim is a durable, auditable
+protocol message rather than an enforced lock. The bridge will pick up
+`task.grant` / `task.deny` automatically when the broker starts emitting them.
+
+## Security
+
+- Only the claimed chat id is accepted. Messages from other chats are logged
+  and dropped.
+- Telegram is not an authenticated channel to the broker in the cryptographic
+  sense; the bridge is a local process with a local bus token. Anyone who can
+  read the bot token can impersonate the bot, and anyone who can write
+  `telegram.json` can re-bind the chat. Treat both files as secrets.
+- Bus messages are shown as data. The bridge never runs a command from a bus
+  message and never turns bus text into a Telegram command.
