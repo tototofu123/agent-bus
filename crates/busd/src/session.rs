@@ -203,7 +203,15 @@ async fn op_register(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrit
             Some(hash_token(&t))
         }
     };
-    let role = Role::assign(&agent);
+    // A person is not a model, so the model floor does not apply. Keeping the
+    // role at `peer` is the honest capability statement: a human surface can
+    // send every non-broker kind, and `validate_send` separately allows
+    // `policy` only for human senders.
+    let role = if agent.is_human_surface() {
+        Role::Peer
+    } else {
+        Role::assign(&agent)
+    };
     state
         .store
         .upsert_agent(&agent, role, token_hash.as_deref())?;
@@ -346,9 +354,14 @@ async fn op_send(
         write(writer, &err_value("rate", "over 60 msg/s")).await?;
         return Ok(());
     }
-    let role = state.store.agent_role(&agent.id)?.unwrap_or(Role::Protocol);
-    let mut env = envelope_from_op(&room, agent, msg, kind);
-    if let Err((code, m)) = crate::router::validate_send(&env, kind, role) {
+    let human = agent.is_human_surface();
+    let role = if human {
+        Role::Peer
+    } else {
+        state.store.agent_role(&agent.id)?.unwrap_or(Role::Protocol)
+    };
+    let mut env = envelope_from_op(&room, agent, msg, kind, human);
+    if let Err((code, m)) = crate::router::validate_send(&env, kind, role, human) {
         write(writer, &err_value(&code, m)).await?;
         return Ok(());
     }
@@ -374,7 +387,13 @@ async fn op_send(
 }
 /// Build an envelope from a client `send`/`send_batch` message body. Shared so
 /// the single and batch paths accept exactly the same fields.
-fn envelope_from_op(room: &str, agent: &Agent, msg: &Value, kind: Kind) -> Envelope {
+fn envelope_from_op(
+    room: &str,
+    agent: &Agent,
+    msg: &Value,
+    kind: Kind,
+    human: bool,
+) -> Envelope {
     let mut env = Envelope::new(room, agent.clone(), kind);
     env.text = msg.get("text").and_then(|t| t.as_str().map(String::from));
     env.payload = msg.get("payload").cloned().filter(|p| !p.is_null());
@@ -383,6 +402,11 @@ fn envelope_from_op(room: &str, agent: &Agent, msg: &Value, kind: Kind) -> Envel
         .get("reply_to")
         .and_then(|t| t.as_str().map(String::from));
     env.lamport = msg.get("lamport").and_then(|l| l.as_u64()).unwrap_or(0);
+    // Trust is stamped here, broker-side, never accepted from the sender.
+    // `assign_and_insert` only fills this when it is still unset.
+    if human {
+        env.trust = Some(Trust::Human);
+    }
     env
 }
 
@@ -445,7 +469,12 @@ async fn op_send_batch(
 
     // Build every envelope first: a frame that cannot parse must not leave a
     // half-committed batch behind.
-    let role = state.store.agent_role(&agent.id)?.unwrap_or(Role::Protocol);
+    let human = agent.is_human_surface();
+    let role = if human {
+        Role::Peer
+    } else {
+        state.store.agent_role(&agent.id)?.unwrap_or(Role::Protocol)
+    };
     let mut built: Vec<(Envelope, Kind)> = Vec::with_capacity(items.len());
     for item in items {
         let Some(kind_str) = item.get("kind").and_then(|k| k.as_str()) else {
@@ -460,9 +489,9 @@ async fn op_send_batch(
             .await?;
             return Ok(());
         };
-        let env = envelope_from_op(&room, agent, item, kind);
+        let env = envelope_from_op(&room, agent, item, kind, human);
         // Validate before anything is written, so a rejected frame rejects wholly.
-        if let Err((code, m)) = crate::router::validate_send(&env, kind, role) {
+        if let Err((code, m)) = crate::router::validate_send(&env, kind, role, human) {
             write(writer, &err_value(&code, m)).await?;
             return Ok(());
         }

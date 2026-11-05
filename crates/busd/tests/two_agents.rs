@@ -403,6 +403,51 @@ async fn tail_streams_live_traffic() -> Result<()> {
 }
 
 #[tokio::test]
+async fn human_surface_is_stamped_human_and_may_claim() -> Result<()> {
+    let server = start_server().await?;
+
+    // A person is not model-floored: `@human`/telegram registers as peer.
+    let mut c = Client::connect(server.port).await?;
+    let reg = c.register("@human", "telegram", None).await?;
+    assert_eq!(reg["role"], "peer", "human surface must not be model-floored");
+    let token = reg["token"].as_str().unwrap().to_string();
+
+    let mut c = Client::connect(server.port).await?;
+    c.send(&agent_hello("@human", None, Some(&token))).await?;
+    let _ = c.read().await;
+    c.op(json!({"op": "join", "room": "#human"})).await?;
+
+    // Claims are allowed for a human surface.
+    let claim = c
+        .op(json!({"op": "send", "room": "#human", "kind": "task.claim",
+                   "text": "taking login.ts",
+                   "payload": {"files": ["src/auth/login.ts"], "claim_ttl_s": 300}}))
+        .await?;
+    assert_eq!(claim["op"], "sent");
+
+    // Policy is human-only, and a human surface may send it.
+    let policy = c
+        .op(json!({"op": "send", "room": "#human", "kind": "policy",
+                   "text": "ship it",
+                   "payload": {"deny": ["src/db/**"]}}))
+        .await?;
+    assert_eq!(policy["op"], "sent");
+
+    // The broker, not the sender, stamped trust=human on both.
+    let mut hist = Client::connect(server.port).await?;
+    hist.send(&json!({"op": "hello", "v": 1})).await?;
+    let _ = hist.read().await;
+    let h = hist.op(json!({"op": "history", "room": "#human"})).await?;
+    let msgs = h["messages"].as_array().unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0]["kind"], "task.claim");
+    assert_eq!(msgs[0]["trust"], "human");
+    assert_eq!(msgs[1]["kind"], "policy");
+    assert_eq!(msgs[1]["trust"], "human");
+    Ok(())
+}
+
+#[tokio::test]
 async fn ordering_many_senders_no_gaps() -> Result<()> {
     let server = start_server().await?;
     let room = "#storm";

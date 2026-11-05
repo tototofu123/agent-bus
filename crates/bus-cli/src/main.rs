@@ -1,5 +1,6 @@
 //! `bus` — the universal adapter. One-shot commands over TCP loopback NDJSON.
 
+mod telegram;
 mod watch;
 
 use anyhow::{anyhow, Context, Result};
@@ -51,6 +52,8 @@ enum Cmd {
     Rooms,
     /// Replay a room from a cursor
     History(HistoryArgs),
+    /// Bridge a room to Telegram (two-way: read, send, claim)
+    Telegram(TelegramArgs),
 }
 
 #[derive(Args)]
@@ -163,6 +166,25 @@ struct HistoryArgs {
     /// print full envelopes as JSON lines
     #[arg(long)]
     full: bool,
+}
+
+#[derive(Args, Clone)]
+struct TelegramArgs {
+    /// room to bridge (default: the saved room, else #repo:agent-bus)
+    #[arg(long)]
+    room: Option<String>,
+    /// bus identity used for messages typed in Telegram
+    #[arg(long, default_value = "@human")]
+    agent: String,
+    /// file holding the Telegram bot token
+    #[arg(long)]
+    token_file: Option<String>,
+    /// Telegram API base (useful for a local mock)
+    #[arg(long, default_value = "https://api.telegram.org")]
+    api_base: String,
+    /// bind this chat id instead of the first chat that messages the bot
+    #[arg(long)]
+    chat: Option<i64>,
 }
 
 fn port(cli_port: Option<u16>) -> u16 {
@@ -482,6 +504,12 @@ async fn run(cli: Cli) -> Result<()> {
         prefer: cli.transport.clone(),
         pipe: cli.pipe.clone(),
     };
+    // The bridge owns its connections (a long-lived tail plus one-shot sends),
+    // so it must not inherit the single connected client the other commands use.
+    if let Cmd::Telegram(a) = &cli.cmd {
+        return telegram::run(a.clone(), p, transport).await;
+    }
+
     let mut c = transport.connect(p).await?;
 
     match cli.cmd {
@@ -828,6 +856,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Telegram(_) => unreachable!("telegram handled before connecting"),
     }
     Ok(())
 }

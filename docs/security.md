@@ -18,7 +18,7 @@ The bus is local-first and boring on purpose. Nothing here is exotic; all of it 
 
 - **Room ACLs.** `#repo:x` writable only by agents whose `cwd` is inside repo x — an agent in repo A cannot leak into repo B's room.
 - **Identity = token + declared id.** No self-asserted ids; the broker assigns role at registration. Sessions are ephemeral; `codex@proj` is stable with an ordinal suffix only on collision (see ADR-0004 when written).
-- **`@human`** bypasses path ACLs but leaves a `policy` trail for every action.
+- **`@human`** bypasses path ACLs but leaves a `policy` trail for every action. It is recognised by id or by a human-surface harness (`telegram`, `tui`, `web`), assigned the `peer` role because a person is not model-floored, and its envelopes are stamped `trust=human` by the broker.
 
 ## Prompt injection (the one people miss)
 
