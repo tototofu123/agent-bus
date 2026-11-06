@@ -301,12 +301,14 @@ async fn bus_who(transport: &Transport, port: u16, room: &str) -> Result<String>
     }
     let mut lines = Vec::new();
     for a in agents {
+        let online = a.get("online").and_then(|o| o.as_bool()).unwrap_or(false);
         lines.push(format!(
-            "{:<28} {:<12} {:<20} role={}",
+            "{:<26} {:<11} {:<18} {:<8} {}",
             a.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
             a.get("harness").and_then(|v| v.as_str()).unwrap_or("?"),
             a.get("model").and_then(|v| v.as_str()).unwrap_or("-"),
             a.get("role").and_then(|v| v.as_str()).unwrap_or("?"),
+            if online { "online" } else { "offline" },
         ));
     }
     Ok(lines.join("\n"))

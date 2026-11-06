@@ -489,6 +489,25 @@ fn fmt_env(env: &Value, format: &str) -> String {
     format!("[{seq}] {kind} {from} ({room}): {text}")
 }
 
+/// Relative age for `who`: compact enough for a table, honest about age.
+fn human_age(ms: i64) -> String {
+    if ms <= 0 {
+        return "-".into();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let secs = (now - ms).max(0) / 1000;
+    match secs {
+        0..=4 => "now".into(),
+        5..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -807,13 +826,43 @@ async fn run(cli: Cli) -> Result<()> {
             c.bye().await;
             if let Some(agents) = reply.get("agents").and_then(|a| a.as_array()) {
                 for a in agents {
+                    let online = a.get("online").and_then(|o| o.as_bool()).unwrap_or(false);
+                    let seen = human_age(
+                        a.get("last_seen_ms").and_then(|s| s.as_i64()).unwrap_or(0),
+                    );
+                    let rooms = a
+                        .get("rooms")
+                        .and_then(|r| r.as_array())
+                        .map(|r| {
+                            r.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    let caps = a
+                        .get("caps")
+                        .and_then(|c| c.as_array())
+                        .map(|c| {
+                            c.iter()
+                                .filter_map(|v| v.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
                     println!(
-                        "{:<28} {:<12} {:<22} role={}",
+                        "{:<28} {:<12} {:<18} {:<8} {:<7} {:<5} {}",
                         a.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
                         a.get("harness").and_then(|h| h.as_str()).unwrap_or("?"),
                         a.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
                         a.get("role").and_then(|r| r.as_str()).unwrap_or("?"),
+                        if online { "online" } else { "offline" },
+                        seen,
+                        if rooms.is_empty() { "-" } else { rooms.as_str() },
                     );
+                    if !caps.is_empty() {
+                        println!("{:<28} caps={caps}", "");
+                    }
                 }
                 if agents.is_empty() {
                     println!("(nobody)");

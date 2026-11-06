@@ -195,19 +195,32 @@ impl Store {
         // two branches must bind different argument lists.
         let sql = match room {
             Some(_) => {
-                "SELECT a.id, a.harness, a.model, a.last_seen, a.role FROM agents a
-                           JOIN members m ON m.agent = a.id WHERE m.room = ?1 ORDER BY a.id"
+                "SELECT a.id, a.harness, a.model, a.last_seen, a.role, a.caps,
+                        (SELECT group_concat(m2.room, ',') FROM members m2 WHERE m2.agent = a.id)
+                 FROM agents a JOIN members m ON m.agent = a.id
+                 WHERE m.room = ?1 ORDER BY a.id"
             }
-            None => "SELECT id, harness, model, last_seen, role FROM agents ORDER BY id",
+            None => {
+                "SELECT id, harness, model, last_seen, role, caps,
+                        (SELECT group_concat(m2.room, ',') FROM members m2 WHERE m2.agent = agents.id)
+                 FROM agents ORDER BY id"
+            }
         };
         let mut stmt = conn.prepare(sql)?;
         let row = |r: &rusqlite::Row| -> rusqlite::Result<serde_json::Value> {
+            let caps: String = r.get(5)?;
+            let rooms: Option<String> = r.get(6)?;
             Ok(serde_json::json!({
                 "id": r.get::<_, String>(0)?,
                 "harness": r.get::<_, String>(1)?,
                 "model": r.get::<_, Option<String>>(2)?,
                 "last_seen_ms": r.get::<_, i64>(3)?,
                 "role": r.get::<_, String>(4)?,
+                "caps": serde_json::from_str::<Vec<String>>(&caps).unwrap_or_default(),
+                // group_concat returns NULL for an agent in no rooms.
+                "rooms": rooms
+                    .map(|s| s.split(',').filter(|r| !r.is_empty()).map(String::from).collect::<Vec<_>>())
+                    .unwrap_or_default(),
             }))
         };
         let rows = match room {

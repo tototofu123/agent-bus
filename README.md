@@ -124,7 +124,7 @@ Everything is built from these:
 | **identity** | `bus register` | stable id (`<harness>@<repo>`), token, declared capabilities |
 | **room** | `bus join/leave` | ordered, durable, append-only log scoped by ACL |
 | **message** | `bus send/recv/tail/history` | typed envelope, monotonic per-room seq, cursor replay |
-| **presence** | `bus who` | heartbeat + TTL; who is here, on what model, holding what |
+| **presence** | `bus who` | live connection presence + last-seen; who is here, on what model, holding what |
 | **claim** | `bus claim/release` | leased path-glob file locks; first writer wins |
 | **handoff** | `bus handoff` | task + bounded context summary + artifact refs, to another agent |
 
