@@ -137,7 +137,15 @@ Workspace: $folder
 Other readable folders: $($extras -join '; ')
 Standing memory:
 $memory
-Rules: plain text; hard limit 140 words unless the human explicitly asks for a report or code; lead with the answer; no markdown tables; no code fences unless code is requested; prefer one authoritative source and do not repeat the same facts from several sources; if you are unsure, say what you checked.
+Rules for Telegram, which renders this Markdown into HTML:
+- lead with the answer, then at most three short sections; hard limit 140 words unless the human explicitly asks for a report or code
+- open with a short bold heading and one fitting emoji, like: ## 🌤️ HK weekend
+- use **bold** for section labels and *italic* only for emphasis; do not nest styles
+- when you used web_search, close with 1-3 sources as [name](https://...) links; the first link shows a preview card
+- a small pipe table renders as an aligned monospace block; use one only for a few rows
+- Telegram has no text colour and no native table widget: never claim colour support, use emoji and bold for hierarchy
+- no fenced code unless the question is about code
+- prefer one authoritative source and do not repeat the same facts from several sources; if unsure, say what you checked
 "@
 
 $prompt = @"

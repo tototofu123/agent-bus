@@ -167,6 +167,23 @@ bus listen --room '#repo:agent-bus' --agent omp@bus --name omp `
   several listeners cannot ping-pong.
 - The mention is stripped before the handler runs.
 
+## Rich replies
+
+Outbound messages are rendered as Telegram HTML, so an agent's Markdown arrives
+formatted instead of as literal symbols:
+
+- `## Heading` becomes a **bold heading**
+- `**bold**`, `*italic*`, `` `code` ``
+- `[name](https://...)` becomes a tappable link, and the first link shows a
+  preview card
+- a fenced code block becomes a monospace block
+- a small pipe table becomes an aligned monospace block
+
+Text is escaped before rendering, so a `<` in an answer stays literal. If
+Telegram still rejects the HTML, the same chunk is resent as plain text rather
+than dropped. Long answers are split on line boundaries *before* rendering, so
+a tag is never cut across two messages.
+
 ## What is stored where
 
 | Path | Contents |

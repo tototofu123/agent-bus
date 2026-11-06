@@ -17,7 +17,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 const DEFAULT_ROOM: &str = "#repo:agent-bus";
-const TELEGRAM_TEXT_LIMIT: usize = 3_800;
 const POLL_TIMEOUT_S: u64 = 20;
 
 #[derive(Serialize, Deserialize, Default)]
@@ -162,23 +161,43 @@ impl Telegram {
         } else {
             text
         };
-        let chunks = split_chunks(text, TELEGRAM_TEXT_LIMIT);
+        let chunks = split_markdown_chunks(text, TELEGRAM_MARKDOWN_LIMIT);
         let total = chunks.len();
         for (i, chunk) in chunks.iter().enumerate() {
-            let body = if total > 1 {
-                format!("({}/{})\n{}", i + 1, total, chunk)
+            let prefix = if total > 1 {
+                format!("({}/{})\n", i + 1, total)
             } else {
-                chunk.to_string()
+                String::new()
             };
-            self.call(
-                "sendMessage",
-                json!({
-                    "chat_id": chat_id,
-                    "text": body,
-                    "disable_web_page_preview": true,
-                }),
-            )
-            .await?;
+            let html = format!("{prefix}{}", render_telegram_html(chunk));
+            match self
+                .call(
+                    "sendMessage",
+                    json!({
+                        "chat_id": chat_id,
+                        "text": html,
+                        "parse_mode": "HTML",
+                    }),
+                )
+                .await
+            {
+                Ok(_) => {}
+                // The model wrote markup Telegram's parser rejects. Deliver it
+                // as plain text rather than losing the answer.
+                Err(e) if entity_error(&e) => {
+                    eprintln!("telegram: HTML rejected ({e}), resending as plain text");
+                    let plain = format!("{prefix}{chunk}");
+                    self.call(
+                        "sendMessage",
+                        json!({
+                            "chat_id": chat_id,
+                            "text": plain,
+                        }),
+                    )
+                    .await?;
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -240,6 +259,375 @@ fn split_chunks(text: &str, max_units: usize) -> Vec<String> {
     }
     if !current.is_empty() {
         chunks.push(current);
+    }
+    chunks
+}
+
+/// Telegram rejects messages over 4096 UTF-16 units, and HTML markup adds
+/// characters after rendering, so the raw Markdown is chunked below that and
+/// rendered per chunk. Splitting the raw text, not the rendered HTML, is what
+/// keeps a tag from being cut in half between two messages.
+const TELEGRAM_MARKDOWN_LIMIT: usize = 2_800;
+
+/// Render the slice of Markdown the agents actually write into the HTML that
+/// Telegram accepts: bold headings, emphasis, inline and fenced code, links,
+/// and pipe tables as an aligned monospace block. Anything else is escaped as
+/// literal text, so a `<` can never be mistaken for a tag.
+fn render_telegram_html(markdown: &str) -> String {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+
+        // Fenced code block.
+        if let Some(fence) = trimmed.strip_prefix("```") {
+            let lang = fence.trim();
+            let mut code = String::new();
+            i += 1;
+            while i < lines.len() && !lines[i].trim_start().starts_with("```") {
+                code.push_str(lines[i]);
+                code.push('\n');
+                i += 1;
+            }
+            i += 1; // the closing fence, or the end of the input
+            let escaped = escape_html(code.trim_end_matches('\n'));
+            if lang.is_empty() {
+                out.push_str(&format!("<pre>{escaped}</pre>\n"));
+            } else {
+                out.push_str(&format!(
+                    "<pre><code class=\"language-{}\">{escaped}</code></pre>\n",
+                    escape_html(lang)
+                ));
+            }
+            continue;
+        }
+
+        // Pipe table: header, separator, then rows until a blank line.
+        if line.contains('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+            let mut rows = vec![split_cells(line)];
+            i += 2;
+            while i < lines.len() && !lines[i].trim().is_empty() && lines[i].contains('|') {
+                rows.push(split_cells(lines[i]));
+                i += 1;
+            }
+            out.push_str("<pre>");
+            out.push_str(&escape_html(&render_table(&rows)));
+            out.push_str("</pre>\n");
+            continue;
+        }
+
+        // Headings become bold: Telegram HTML has no heading tag.
+        let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+            let content = trimmed[hashes..].trim();
+            out.push_str(&format!("<b>{}</b>\n", render_inline(content)));
+            i += 1;
+            continue;
+        }
+
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            out.push_str("────────\n");
+            i += 1;
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("> ") {
+            out.push_str(&format!("▎ {}\n", render_inline(rest)));
+            i += 1;
+            continue;
+        }
+
+        if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            out.push_str(&format!("• {}\n", render_inline(rest)));
+            i += 1;
+            continue;
+        }
+
+        out.push_str(&render_inline(line));
+        out.push('\n');
+        i += 1;
+    }
+    out.trim_end().to_string()
+}
+
+/// Inline formatting inside one line: code spans first, then links, then bold,
+/// then emphasis. Escaping happens as the text is copied, so literal markup in
+/// the agent's answer stays literal.
+fn render_inline(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '&' => {
+                out.push_str("&amp;");
+                i += 1;
+            }
+            '<' => {
+                out.push_str("&lt;");
+                i += 1;
+            }
+            '>' => {
+                out.push_str("&gt;");
+                i += 1;
+            }
+            '`' => {
+                if let Some(end) = find_char(&chars, i + 1, '`') {
+                    let code: String = chars[i + 1..end].iter().collect();
+                    out.push_str("<code>");
+                    out.push_str(&escape_html(&code));
+                    out.push_str("</code>");
+                    i = end + 1;
+                } else {
+                    out.push('`');
+                    i += 1;
+                }
+            }
+            '[' => {
+                if let Some((label, url, next)) = parse_link(&chars, i) {
+                    out.push_str("<a href=\"");
+                    out.push_str(&escape_attr(&url));
+                    out.push_str("\">");
+                    out.push_str(&render_inline(&label));
+                    out.push_str("</a>");
+                    i = next;
+                } else {
+                    out.push('[');
+                    i += 1;
+                }
+            }
+            '*' | '_' => {
+                if c == '*' && chars.get(i + 1) == Some(&'*') {
+                    if let Some(end) = find_double(&chars, i + 2) {
+                        let inner: String = chars[i + 2..end].iter().collect();
+                        out.push_str("<b>");
+                        out.push_str(&render_inline(&inner));
+                        out.push_str("</b>");
+                        i = end + 2;
+                        continue;
+                    }
+                }
+                // Emphasis only at word boundaries, so `snake_case` and
+                // `a*b` stay untouched.
+                if can_open_emphasis(&chars, i) {
+                    if let Some(end) = find_emphasis_close(&chars, i + 1, c) {
+                        let inner: String = chars[i + 1..end].iter().collect();
+                        out.push_str("<i>");
+                        out.push_str(&render_inline(&inner));
+                        out.push_str("</i>");
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                out.push(c);
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn find_char(chars: &[char], start: usize, needle: char) -> Option<usize> {
+    chars[start..]
+        .iter()
+        .position(|&c| c == needle)
+        .map(|p| start + p)
+}
+
+fn find_double(chars: &[char], start: usize) -> Option<usize> {
+    let mut j = start;
+    while j + 1 < chars.len() {
+        if chars[j] == '*' && chars[j + 1] == '*' {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+fn is_emphasis_boundary(c: char) -> bool {
+    c.is_whitespace() || "([{<\"'“‘,;:!?)]}>.-".contains(c)
+}
+
+fn can_open_emphasis(chars: &[char], i: usize) -> bool {
+    i == 0 || is_emphasis_boundary(chars[i - 1])
+}
+
+fn find_emphasis_close(chars: &[char], start: usize, marker: char) -> Option<usize> {
+    let mut j = start;
+    while j < chars.len() {
+        if chars[j] == marker && j > start {
+            let after_ok = chars
+                .get(j + 1)
+                .map(|c| is_emphasis_boundary(*c))
+                .unwrap_or(true);
+            if after_ok {
+                return Some(j);
+            }
+        }
+        j += 1;
+    }
+    None
+}
+
+fn parse_link(chars: &[char], i: usize) -> Option<(String, String, usize)> {
+    let close = find_char(chars, i + 1, ']')?;
+    if chars.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let end = find_char(chars, close + 2, ')')?;
+    let url: String = chars[close + 2..end].iter().collect();
+    let url = url.trim().to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let label: String = chars[i + 1..close].iter().collect();
+    Some((label, url, end + 1))
+}
+
+fn split_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    trimmed.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let cells = split_cells(line);
+    !cells.is_empty()
+        && cells
+            .iter()
+            .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':'))
+}
+
+/// Align columns the way musebot's code-block "tables" do. Wide characters
+/// (CJK, emoji) count as two cells so the columns do not drift.
+fn render_table(rows: &[Vec<String>]) -> String {
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; cols];
+    for row in rows {
+        for (c, cell) in row.iter().enumerate() {
+            widths[c] = widths[c].max(cell_width(cell));
+        }
+    }
+    let mut out = String::new();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, width) in widths.iter().enumerate() {
+            let cell = row.get(c).map(String::as_str).unwrap_or("");
+            out.push_str(cell);
+            if c + 1 < cols {
+                let pad = width.saturating_sub(cell_width(cell)) + 2;
+                out.push_str(&" ".repeat(pad));
+            }
+        }
+        if r + 1 < rows.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn cell_width(text: &str) -> usize {
+    text.chars().map(char_width).sum()
+}
+
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    let wide = (0x1100..=0x115F).contains(&cp)
+        || (0x2E80..=0xA4CF).contains(&cp)
+        || (0xAC00..=0xD7A3).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0xFE30..=0xFE4F).contains(&cp)
+        || (0xFF00..=0xFF60).contains(&cp)
+        || (0xFFE0..=0xFFE6).contains(&cp)
+        || (0x1F300..=0x1FAFF).contains(&cp)
+        || (0x20000..=0x3FFFD).contains(&cp);
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn escape_attr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// True when Telegram rejected the message because of the HTML itself. The
+/// fallback is to resend the same chunk as plain text instead of dropping it.
+fn entity_error(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    msg.contains("can't parse entities")
+        || msg.contains("can't find end tag")
+        || msg.contains("unsupported start tag")
+}
+
+/// Group whole lines into chunks under `raw_limit` so the renderer never has
+/// to make a tag that spans two messages. An oversized single line falls back
+/// to the character splitter.
+fn split_markdown_chunks(text: &str, raw_limit: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut units = 0usize;
+    for line in text.lines() {
+        let line_units = line.encode_utf16().count();
+        if line_units > raw_limit {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                units = 0;
+            }
+            chunks.extend(split_chunks(line, raw_limit));
+            continue;
+        }
+        if units > 0 && units + 1 + line_units > raw_limit {
+            chunks.push(std::mem::take(&mut current));
+            units = 0;
+        }
+        if units > 0 {
+            current.push('\n');
+            units += 1;
+        }
+        current.push_str(line);
+        units += line_units;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
     }
     chunks
 }
@@ -915,6 +1303,71 @@ mod tests {
         assert!(chunks
             .iter()
             .all(|c| c.encode_utf16().count() <= 3));
+    }
+
+    #[test]
+    fn markdown_renders_to_telegram_html() {
+        let html = render_telegram_html(
+            "## HK weather\n\n**Sat** is *wet* with `rain`.\n\n[Source](https://hko.gov.hk)",
+        );
+        assert!(html.contains("<b>HK weather</b>"), "{html}");
+        assert!(html.contains("<b>Sat</b>"), "{html}");
+        assert!(html.contains("<i>wet</i>"), "{html}");
+        assert!(html.contains("<code>rain</code>"), "{html}");
+        assert!(
+            html.contains("<a href=\"https://hko.gov.hk\">Source</a>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn html_is_escaped_before_it_reaches_telegram() {
+        assert_eq!(
+            render_telegram_html("a < b & c > d"),
+            "a &lt; b &amp; c &gt; d"
+        );
+    }
+
+    #[test]
+    fn snake_case_is_not_emphasis() {
+        let html = render_inline("file_name and *really*");
+        assert!(html.contains("file_name"), "{html}");
+        assert!(html.contains("<i>really</i>"), "{html}");
+    }
+
+    #[test]
+    fn pipe_tables_render_as_an_aligned_block() {
+        let html = render_telegram_html("| Day | Temp |\n| --- | --- |\n| Sat | 24 |\n| Sun | 22 |");
+        assert!(html.starts_with("<pre>"), "{html}");
+        assert!(html.contains("Day  Temp"), "{html}");
+        assert!(html.contains("Sat  24"), "{html}");
+        assert!(html.contains("Sun  22"), "{html}");
+    }
+
+    #[test]
+    fn fenced_code_is_not_reformatted() {
+        let html = render_telegram_html("```rust\nlet x = 1 < 2;\n```");
+        assert_eq!(
+            html,
+            "<pre><code class=\"language-rust\">let x = 1 &lt; 2;</code></pre>"
+        );
+    }
+
+    #[test]
+    fn markdown_chunks_split_on_lines_under_the_limit() {
+        let text = (0..40)
+            .map(|i| format!("line {i} padding padding"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = split_markdown_chunks(&text, 120);
+        assert!(chunks.len() > 1, "{chunks:?}");
+        for chunk in &chunks {
+            assert!(
+                chunk.encode_utf16().count() <= 120,
+                "chunk over limit: {chunk:?}"
+            );
+            assert!(!chunk.starts_with('\n') && !chunk.ends_with('\n'));
+        }
     }
 
     #[test]
