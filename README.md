@@ -110,7 +110,15 @@ The first chat that messages the bot claims it; the binding is stored once in
 `~/.agent-bus/telegram.json`, so a stranger cannot take over the feed. Plain
 text sends `chat`; `/claim`, `/status`, `/who`, `/rooms`, `/history`, `/room`,
 `/id`, and `/help` cover the rest. Sends are acknowledged with their server
-`seq`.
+`seq` and how many other agents are online.
+
+The bridge is transport, not a model, so a receipt is not a reply. `bus listen`
+is the other half: it tails the room, runs a command per message, and posts
+whatever that command prints back.
+
+```powershell
+bus listen --room '#repo:agent-bus' --exec 'my-responder'
+```
 
 See [docs/telegram.md](docs/telegram.md) for the command table, stored files,
 delivery semantics, and the current claim-scope note.

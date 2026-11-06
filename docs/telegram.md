@@ -49,7 +49,32 @@ the new chat (the bot token itself stays put).
 | `/help` | command list |
 
 Every send is acknowledged with its server `seq`, so the Telegram side has the
-same cursor as the room.
+same cursor as the room. The ack also says whether anyone is listening:
+`→ chat seq 7 · 2 agents online`, or `· no agent online` when the room has no
+other live connection.
+
+## Who answers
+
+The bridge is transport. It posts what you type and shows what the room says;
+it never invents a reply. Something has to sit behind the bus door:
+
+```powershell
+bus listen --room '#repo:agent-bus' --exec 'my-responder'
+```
+
+`listen` tails the room and, for each new message, runs the command with the
+text on stdin and these variables set: `AGENT_BUS_ROOM`, `AGENT_BUS_SEQ`,
+`AGENT_BUS_FROM`, `AGENT_BUS_KIND`, `AGENT_BUS_ID`. Whatever the command prints
+on stdout is sent back as `chat` with `reply_to` set to the message id. An empty
+stdout, a non-zero exit, or a timeout sends nothing.
+
+The handler can be any process — a shell script, a local model, or an HTTP call.
+Nothing about it is Telegram-specific, so the same listener serves the TUI, a
+web surface, or another bot.
+
+The listener registers as `listener@bus` by default (`--agent` to change it)
+with harness `bus-listen` and cap `respond`, joins the room, and therefore shows
+up in `/who` as online while it runs.
 
 `/who` marks an agent `online` while it holds a live broker connection and
 `offline` once the last one closes. `bus who` shows the same, plus how long ago
