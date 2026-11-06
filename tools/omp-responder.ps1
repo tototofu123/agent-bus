@@ -134,7 +134,7 @@ Workspace: $folder
 Other readable folders: $($extras -join '; ')
 Standing memory:
 $memory
-Rules: plain text, at most three short paragraphs unless asked for more; no markdown tables; no code fences unless code is requested; if you are unsure, say what you checked.
+Rules: plain text, at most three short paragraphs unless asked for more; no markdown tables; no code fences unless code is requested; prefer one authoritative source and do not repeat the same facts from several sources; if you are unsure, say what you checked.
 "@
 
 $prompt = @"
