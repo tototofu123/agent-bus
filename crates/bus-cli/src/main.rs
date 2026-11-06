@@ -1,5 +1,6 @@
 //! `bus` — the universal adapter. One-shot commands over TCP loopback NDJSON.
 
+mod listen;
 mod telegram;
 mod watch;
 
@@ -54,6 +55,8 @@ enum Cmd {
     History(HistoryArgs),
     /// Bridge a room to Telegram (two-way: read, send, claim)
     Telegram(TelegramArgs),
+    /// Answer new room messages by running a command
+    Listen(ListenArgs),
 }
 
 #[derive(Args)]
@@ -185,6 +188,34 @@ struct TelegramArgs {
     /// bind this chat id instead of the first chat that messages the bot
     #[arg(long)]
     chat: Option<i64>,
+}
+
+#[derive(Args)]
+struct ListenArgs {
+    /// room to answer in
+    #[arg(long)]
+    room: String,
+    /// command run per message: text on stdin, stdout becomes the reply
+    #[arg(long)]
+    exec: String,
+    /// bus identity the listener registers and replies as
+    #[arg(long, default_value = "listener@bus")]
+    agent: String,
+    /// comma-separated kinds to answer (default chat)
+    #[arg(long, value_delimiter = ',', default_value = "chat")]
+    kinds: Vec<String>,
+    /// kind used for the reply
+    #[arg(long, default_value = "chat")]
+    reply_kind: String,
+    /// model to advertise on the listener's identity
+    #[arg(long)]
+    model: Option<String>,
+    /// seconds a handler may run before it is killed
+    #[arg(long, default_value_t = 120)]
+    timeout: u64,
+    /// handle one message, then exit
+    #[arg(long)]
+    once: bool,
 }
 
 fn port(cli_port: Option<u16>) -> u16 {
@@ -454,6 +485,40 @@ fn read_token(agent: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Register `agent` if the broker does not know it yet, and store the token it
+/// issues. Shared by the long-lived surfaces (`telegram`, `listen`) so both
+/// bootstrap identically: connect anonymously, register, write the token, and
+/// let every later connection use it.
+pub(crate) async fn ensure_registered(
+    transport: &Transport,
+    port: u16,
+    agent: &Agent,
+) -> Result<()> {
+    let existing = read_token(&agent.id);
+    let mut c = transport.connect(port).await?;
+    c.hello(None, None).await?;
+    let mut v = json!({"op": "register", "agent": agent});
+    if let Some(t) = &existing {
+        v["token"] = t.as_str().into();
+    }
+    let reply = c.op(v).await?;
+    c.bye().await;
+    if let Some(token) = reply.get("token").and_then(|t| t.as_str()) {
+        let path = token_path(&agent.id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, token)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        eprintln!("registered {} token stored", agent.id);
+    }
+    Ok(())
+}
+
 fn make_agent(
     id: &str,
     harness: &str,
@@ -527,6 +592,25 @@ async fn run(cli: Cli) -> Result<()> {
     // so it must not inherit the single connected client the other commands use.
     if let Cmd::Telegram(a) = &cli.cmd {
         return telegram::run(a.clone(), p, transport).await;
+    }
+    // `listen` also owns a long-lived tail, so it bootstraps itself rather than
+    // inheriting the single connected client the one-shot commands share.
+    if let Cmd::Listen(a) = &cli.cmd {
+        return listen::run(
+            listen::Config {
+                room: a.room.clone(),
+                exec: a.exec.clone(),
+                agent: a.agent.clone(),
+                model: a.model.clone(),
+                kinds: a.kinds.clone(),
+                reply_kind: a.reply_kind.clone(),
+                timeout_s: a.timeout,
+                once: a.once,
+            },
+            p,
+            transport,
+        )
+        .await;
     }
 
     let mut c = transport.connect(p).await?;
@@ -906,6 +990,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Telegram(_) => unreachable!("telegram handled before connecting"),
+        Cmd::Listen(_) => unreachable!("listen handled before connecting"),
     }
     Ok(())
 }

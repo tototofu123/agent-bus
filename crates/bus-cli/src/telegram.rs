@@ -7,7 +7,7 @@
 //! The first Telegram chat that messages the bot claims it, and the binding is
 //! written once to `$AGENT_BUS_HOME/telegram.json`. Later chats are ignored.
 
-use crate::{bus_home, make_agent, read_token, token_path, Transport};
+use crate::{bus_home, ensure_registered, make_agent, read_token, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use proto::{decode_line, Agent, Envelope};
 use serde::{Deserialize, Serialize};
@@ -220,32 +220,6 @@ fn split_chunks(text: &str, max_units: usize) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Bus helpers (one-shot connections, plus the long-lived tail)
 
-async fn ensure_registered(transport: &Transport, port: u16, agent: &Agent) -> Result<()> {
-    let existing = read_token(&agent.id);
-    let mut c = transport.connect(port).await?;
-    c.hello(None, None).await?;
-    let mut v = json!({"op": "register", "agent": agent});
-    if let Some(t) = &existing {
-        v["token"] = t.as_str().into();
-    }
-    let reply = c.op(v).await?;
-    c.bye().await;
-    if let Some(token) = reply.get("token").and_then(|t| t.as_str()) {
-        let path = token_path(&agent.id);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, token)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        eprintln!("telegram: registered {} token stored", agent.id);
-    }
-    Ok(())
-}
-
 async fn join_room(transport: &Transport, port: u16, agent: &Agent, room: &str) -> Result<i64> {
     let token = read_token(&agent.id);
     let mut c = transport.connect(port).await?;
@@ -312,6 +286,54 @@ async fn bus_who(transport: &Transport, port: u16, room: &str) -> Result<String>
         ));
     }
     Ok(lines.join("\n"))
+}
+
+/// How many *other* agents currently hold a live connection in this room.
+///
+/// Used in the send ack so a receipt does not read as a reply: with nobody
+/// online, the human should see that instead of an unexplained `seq`.
+async fn other_agents_online(
+    transport: &Transport,
+    port: u16,
+    room: &str,
+    exclude: &str,
+) -> Result<usize> {
+    let mut c = transport.connect(port).await?;
+    c.hello(None, None).await?;
+    let reply = c.op(json!({"op": "who", "room": room})).await?;
+    c.bye().await;
+    Ok(reply
+        .get("agents")
+        .and_then(|a| a.as_array())
+        .map(|agents| {
+            agents
+                .iter()
+                .filter(|a| {
+                    a.get("online").and_then(|o| o.as_bool()).unwrap_or(false)
+                        && a.get("id").and_then(|i| i.as_str()) != Some(exclude)
+                })
+                .count()
+        })
+        .unwrap_or(0))
+}
+
+/// The short suffix on a send ack. Empty when the probe failed, so a broker
+/// hiccup never turns a delivered message into a visible failure.
+async fn delivery_note(transport: &Transport, port: u16, room: &str, agent_id: &str) -> String {
+    match other_agents_online(transport, port, room, agent_id).await {
+        Ok(0) => "no agent online".into(),
+        Ok(1) => "1 agent online".into(),
+        Ok(n) => format!("{n} agents online"),
+        Err(_) => String::new(),
+    }
+}
+
+fn ack_line(kind: &str, seq: i64, note: &str) -> String {
+    if note.is_empty() {
+        format!("→ {kind} seq {seq}")
+    } else {
+        format!("→ {kind} seq {seq} · {note}")
+    }
 }
 
 async fn bus_rooms(transport: &Transport, port: u16) -> Result<String> {
@@ -552,7 +574,8 @@ async fn handle_text(
             None,
         )
         .await?;
-        tg.send_message(chat_id, &format!("→ chat seq {seq}"))
+        let note = delivery_note(transport, port, room, &agent.id).await;
+        tg.send_message(chat_id, &ack_line("chat", seq, &note))
             .await?;
         return Ok(());
     };
@@ -641,7 +664,8 @@ async fn handle_text(
             }
             let (_, seq) =
                 send_once(transport, port, agent, room, "chat", Some(rest), None).await?;
-            tg.send_message(chat_id, &format!("→ chat seq {seq}"))
+            let note = delivery_note(transport, port, room, &agent.id).await;
+            tg.send_message(chat_id, &ack_line("chat", seq, &note))
                 .await?;
         }
         other => {
@@ -879,5 +903,18 @@ mod tests {
         let line = format_envelope(&env);
         assert!(line.starts_with("[7] chat · codex@test"));
         assert!(line.ends_with("hi"));
+    }
+
+    #[test]
+    fn acks_say_whether_anyone_is_listening() {
+        assert_eq!(ack_line("chat", 7, ""), "→ chat seq 7");
+        assert_eq!(
+            ack_line("chat", 7, "no agent online"),
+            "→ chat seq 7 · no agent online"
+        );
+        assert_eq!(
+            ack_line("chat", 7, "2 agents online"),
+            "→ chat seq 7 · 2 agents online"
+        );
     }
 }
