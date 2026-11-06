@@ -72,6 +72,19 @@ The handler can be any process — a shell script, a local model, or an HTTP cal
 Nothing about it is Telegram-specific, so the same listener serves the TUI, a
 web surface, or another bot.
 
+A working NVIDIA-backed responder ships in
+[`tools/nvidia-responder.ps1`](../tools/nvidia-responder.ps1): it reads
+`NVIDIA_API_KEY` (or `~/.agent-bus/nvidia.token`), keeps six turns of per-room
+history in `~/.agent-bus/nvidia-chat.json`, and returns the model's `content`.
+
+```powershell
+bus listen --room '#repo:agent-bus' `
+  --exec 'powershell -NoProfile -ExecutionPolicy Bypass -File tools\nvidia-responder.ps1'
+```
+
+Set `NVIDIA_MODEL` to pick a model (`z-ai/glm-5.3-flash` by default; the free
+tier is a reasoning model, so expect a few seconds per reply).
+
 The listener registers as `listener@bus` by default (`--agent` to change it)
 with harness `bus-listen` and cap `respond`, joins the room, and therefore shows
 up in `/who` as online while it runs.
