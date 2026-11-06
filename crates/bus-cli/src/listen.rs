@@ -172,7 +172,7 @@ async fn answer(
     };
     let output = tokio::time::timeout(
         Duration::from_secs(timeout_s),
-        run_handler(exec, &input, env),
+        run_handler(exec, &input, env, port),
     )
     .await
     .map_err(|_| anyhow!("handler exceeded {timeout_s}s"))??;
@@ -201,7 +201,14 @@ async fn answer(
 }
 
 /// Run `cmdline` through the platform shell with the envelope as context.
-async fn run_handler(cmdline: &str, input: &str, env: &Envelope) -> Result<String> {
+async fn run_handler(cmdline: &str, input: &str, env: &Envelope, port: u16) -> Result<String> {
+    // A handler that wants to read the room (recent history for memory, who is
+    // online, another send) needs to reach the same broker the listener uses.
+    // Hand it the path to this very binary and the port, rather than assuming
+    // `bus` is on PATH or that the default port is in play.
+    let bus_bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "bus".to_string());
     let mut cmd = shell_command(cmdline);
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -212,6 +219,8 @@ async fn run_handler(cmdline: &str, input: &str, env: &Envelope) -> Result<Strin
         .env("AGENT_BUS_FROM", &env.from.id)
         .env("AGENT_BUS_KIND", &env.kind)
         .env("AGENT_BUS_ID", &env.id)
+        .env("AGENT_BUS_BIN", bus_bin)
+        .env("AGENT_BUS_PORT", port.to_string())
         .spawn()?;
 
     if let Some(mut stdin) = child.stdin.take() {

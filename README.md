@@ -120,6 +120,11 @@ whatever that command prints back.
 bus listen --room '#repo:agent-bus' --exec 'my-responder'
 ```
 
+`tools/omp-responder.ps1` is the tool-calling variant: it runs a local `omp`
+session with read/glob/grep/web_search, routed to a folder per room through
+`~/.agent-bus/workspaces.json`, so "weather in HK" actually fetches HKO instead
+of guessing. Local only — close the listener and the agent is gone.
+
 See [docs/telegram.md](docs/telegram.md) for the command table, stored files,
 delivery semantics, and the current claim-scope note.
 

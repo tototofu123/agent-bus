@@ -64,7 +64,8 @@ bus listen --room '#repo:agent-bus' --exec 'my-responder'
 
 `listen` tails the room and, for each new message, runs the command with the
 text on stdin and these variables set: `AGENT_BUS_ROOM`, `AGENT_BUS_SEQ`,
-`AGENT_BUS_FROM`, `AGENT_BUS_KIND`, `AGENT_BUS_ID`. Whatever the command prints
+`AGENT_BUS_FROM`, `AGENT_BUS_KIND`, `AGENT_BUS_ID`, `AGENT_BUS_BIN` (the path to
+the running `bus` binary) and `AGENT_BUS_PORT`. Whatever the command prints
 on stdout is sent back as `chat` with `reply_to` set to the message id. An empty
 stdout, a non-zero exit, or a timeout sends nothing.
 
@@ -84,6 +85,40 @@ bus listen --room '#repo:agent-bus' `
 
 Set `NVIDIA_MODEL` to pick a model (`z-ai/glm-5.3-flash` by default; the free
 tier is a reasoning model, so expect a few seconds per reply).
+
+### Local agent with tools
+
+A raw chat completion cannot see the weather or the repo. For tool calling, use
+a local agent CLI instead — the reply path stays exactly the same:
+
+```powershell
+bus listen --room '#repo:agent-bus' --agent assistant@bus `
+  --exec 'C:\Users\you\.agent-bus\omp-responder.cmd' --timeout 300
+```
+
+[`tools/omp-responder.ps1`](../tools/omp-responder.ps1) runs `omp -p` with
+`read,glob,grep,web_search` (read-only; no write/bash), an ephemeral session
+(`--no-session`), and the room folder as its cwd. It is local by design: close
+the listener and the agent is gone.
+
+Folder routing and standing memory live outside the repo, in
+`~/.agent-bus/workspaces.json`:
+
+```json
+{
+  "default_folder": "C:\\Users\\you\\.agent-bus\\workspace",
+  "rooms": { "#repo:agent-bus": "C:\\...\\agent-bus" },
+  "extra_dirs": ["C:\\...\\obsidian-data\\Projects\\Antigravity"]
+}
+```
+
+On first run the responder creates `~/.agent-bus/workspace/{notes,inbox,scratch}`
+and `memory.md`. `memory.md` is injected into every prompt; the folders are
+read-only context. The last 8 `chat` messages are read from the broker each
+time, so the conversation remembers itself without a persistent model session.
+
+Measured locally: ~30–70 s for a web-backed answer on the free NVIDIA tier,
+including the tool call.
 
 The listener registers as `listener@bus` by default (`--agent` to change it)
 with harness `bus-listen` and cap `respond`, joins the room, and therefore shows
