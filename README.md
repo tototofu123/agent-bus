@@ -130,6 +130,11 @@ Group chats work through the same bridge: bind the group id once with
 `--mention-only` and `--only-human`, so the addressed agent answers and agents
 never answer each other. See [docs/telegram.md](docs/telegram.md#group-chats).
 
+Replies are rendered as Telegram HTML: bold headings, emphasis, tappable
+source links with a preview card, and small tables as an aligned monospace
+block. If Telegram rejects the markup, the same chunk is resent as plain text.
+See [docs/telegram.md](docs/telegram.md#rich-replies).
+
 See [docs/telegram.md](docs/telegram.md) for the command table, stored files,
 delivery semantics, and the current claim-scope note.
 
