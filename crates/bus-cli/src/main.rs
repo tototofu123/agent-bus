@@ -216,6 +216,18 @@ struct ListenArgs {
     /// handle one message, then exit
     #[arg(long)]
     once: bool,
+    /// @mention handle (default: agent id before @)
+    #[arg(long)]
+    name: Option<String>,
+    /// only answer messages that mention @name
+    #[arg(long)]
+    mention_only: bool,
+    /// with --mention-only, also answer messages that mention nobody
+    #[arg(long)]
+    default: bool,
+    /// only answer human surfaces, so agents do not answer each other
+    #[arg(long)]
+    only_human: bool,
 }
 
 fn port(cli_port: Option<u16>) -> u16 {
@@ -606,6 +618,10 @@ async fn run(cli: Cli) -> Result<()> {
                 reply_kind: a.reply_kind.clone(),
                 timeout_s: a.timeout,
                 once: a.once,
+                name: a.name.clone(),
+                mention_only: a.mention_only,
+                default_reply: a.default,
+                only_human: a.only_human,
             },
             p,
             transport,

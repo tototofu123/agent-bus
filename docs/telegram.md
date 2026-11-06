@@ -130,6 +130,43 @@ the agent was last seen, its rooms and its caps. Presence is per broker
 process: after a restart everyone is offline until they reconnect, which is the
 truthful answer.
 
+## Group chats
+
+The bridge binds one chat. To use a Telegram group, add the bot to the group
+and bind the group id once:
+
+```powershell
+bus telegram --room '#repo:agent-bus' --chat -5312549577
+```
+
+A negative id is a group; `--chat` writes the binding and greets once, and later
+restarts reuse it. Without `--chat`, the first chat to message the bot claims it.
+
+What the bot can see depends on BotFather privacy:
+
+- **Privacy disabled** (this bot): every group message reaches the bridge.
+- **Privacy on**: only `/commands`, replies to the bot, and `@botusername`
+  mentions arrive. The bridge strips its own `@username` before the bus sees
+  the text, so the agents get the question rather than the wake word.
+
+Mention routing lets several agents share the group without all answering:
+
+```powershell
+bus listen --room '#repo:agent-bus' --agent assistant@bus --name assistant `
+  --mention-only --default --only-human --timeout 300 `
+  --exec 'C:\Users\you\.agent-bus\omp-responder.cmd'
+
+bus listen --room '#repo:agent-bus' --agent omp@bus --name omp `
+  --mention-only --only-human --timeout 300 `
+  --exec 'C:\Users\you\.agent-bus\omp-code.cmd'
+```
+
+- `@omp ...` reaches omp alone; `@assistant ...` reaches assistant alone.
+- A message with no mention reaches the listener marked `--default`.
+- `--only-human` means agents never answer other agents, so a group with
+  several listeners cannot ping-pong.
+- The mention is stripped before the handler runs.
+
 ## What is stored where
 
 | Path | Contents |

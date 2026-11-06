@@ -125,6 +125,11 @@ session with read/glob/grep/web_search, routed to a folder per room through
 `~/.agent-bus/workspaces.json`, so "weather in HK" actually fetches HKO instead
 of guessing. Local only — close the listener and the agent is gone.
 
+Group chats work through the same bridge: bind the group id once with
+`--chat <id>`, then route with `@assistant` or `@omp`. Listeners use
+`--mention-only` and `--only-human`, so the addressed agent answers and agents
+never answer each other. See [docs/telegram.md](docs/telegram.md#group-chats).
+
 See [docs/telegram.md](docs/telegram.md) for the command table, stored files,
 delivery semantics, and the current claim-scope note.
 
