@@ -192,6 +192,33 @@ fn redact_token(text: &str, token: &str) -> String {
     text.replace(token, "<telegram-token>")
 }
 
+/// Remove the bot's own `@username` from group text. Telegram includes it when
+/// a human addresses the bot to wake it; the agents behind the bus should see
+/// the question, not the wake word.
+fn strip_self_mention(text: &str, username: &str) -> String {
+    let needle = format!("@{}", username.to_ascii_lowercase());
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut search = 0usize;
+    while let Some(pos) = lower[search..].find(&needle) {
+        let at = search + pos;
+        let end = at + needle.len();
+        let boundary = text[end..]
+            .chars()
+            .next()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        if boundary {
+            out.push_str(&text[last..at]);
+            last = end;
+        }
+        search = end;
+    }
+    out.push_str(&text[last..]);
+    out.trim().to_string()
+}
+
 /// Split on UTF-16 code units, which is what Telegram's 4096 limit counts.
 /// Splitting on characters would overflow for emoji-heavy text, and splitting
 /// on bytes would slice a code point in half.
@@ -729,6 +756,7 @@ pub async fn run(args: crate::TelegramArgs, port: u16, transport: Transport) -> 
         bail!("room must be # prefixed and contain no whitespace: {room:?}");
     }
     state.room = Some(room.clone());
+    let had_chat = state.chat_id;
     if let Some(chat) = args.chat {
         state.chat_id = Some(chat);
     }
@@ -746,16 +774,26 @@ pub async fn run(args: crate::TelegramArgs, port: u16, transport: Transport) -> 
         Some(chat) => chat,
         None => discover_chat(&tg, &mut state).await?,
     };
-    let _ = tg
-        .send_message(
-            chat_id,
-            &format!(
-                "agent-bus connected.\nRoom: {room}\nIdentity: {}\nThe first chat to message the bot owns it. Send /help for commands.",
+    let newly_bound = state.chat_id != had_chat;
+    if newly_bound {
+        let text = if chat_id < 0 {
+            format!(
+                "agent-bus connected to this group.\nRoom: {room}\nHumans write as {}.\nAgents answer when mentioned by name; send /who to list them. A message with no mention reaches the default agent.",
                 agent.id
-            ),
-        )
-        .await
-        .map_err(|e| eprintln!("telegram: greeting failed: {e:#}"));
+            )
+        } else {
+            format!(
+                "agent-bus connected.\nRoom: {room}\nIdentity: {}\nSend /help for commands.",
+                agent.id
+            )
+        };
+        let _ = tg
+            .send_message(chat_id, &text)
+            .await
+            .map_err(|e| eprintln!("telegram: greeting failed: {e:#}"));
+    } else {
+        eprintln!("telegram: bound to chat {chat_id}");
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::spawn(tail_loop(
@@ -791,6 +829,13 @@ pub async fn run(args: crate::TelegramArgs, port: u16, transport: Transport) -> 
                             };
                             if from_chat != chat_id || from_bot {
                                 eprintln!("telegram: ignoring chat {from_chat}");
+                                save_state(&state)?;
+                                continue;
+                            }
+                            // A group wake-word (`@bot`) is not part of the
+                            // question; strip it before the bus sees the text.
+                            let text = strip_self_mention(&text, username);
+                            if text.is_empty() {
                                 save_state(&state)?;
                                 continue;
                             }
@@ -915,6 +960,27 @@ mod tests {
         assert_eq!(
             ack_line("chat", 7, "2 agents online"),
             "→ chat seq 7 · 2 agents online"
+        );
+    }
+
+    #[test]
+    fn bot_mention_is_stripped_before_the_bus() {
+        assert_eq!(
+            strip_self_mention("@opencodetototofubot weather in hk", "opencodetototofubot"),
+            "weather in hk"
+        );
+        assert_eq!(
+            strip_self_mention("@Assistant look", "opencodetototofubot"),
+            "@Assistant look"
+        );
+        assert_eq!(
+            strip_self_mention("hey @opencodetototofubot, hi", "opencodetototofubot"),
+            "hey , hi"
+        );
+        // A longer username that merely starts the same must not be cut.
+        assert_eq!(
+            strip_self_mention("@opencodetototofubot2 hi", "opencodetototofubot"),
+            "@opencodetototofubot2 hi"
         );
     }
 }

@@ -24,6 +24,7 @@
 #   OMP_HISTORY    how many earlier messages to include (default 8)
 #   OMP_TIMEOUT    seconds before the child is killed (default 300)
 #   OMP_TOOLS      default read,glob,grep,web_search (read-only + web)
+#   OMP_PERSONA    optional extra lead paragraph for the system prompt
 #   OMP_WORKSPACES default ~/.agent-bus/workspaces.json
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +42,7 @@ $omp = if ($env:OMP_BIN) { $env:OMP_BIN } else { 'omp' }
 $maxHistory = if ($env:OMP_HISTORY) { [int]$env:OMP_HISTORY } else { 8 }
 $timeoutMs = if ($env:OMP_TIMEOUT) { [int]$env:OMP_TIMEOUT * 1000 } else { 300000 }
 $tools = if ($env:OMP_TOOLS) { $env:OMP_TOOLS } else { 'read,glob,grep,web_search' }
+$persona = if ($env:OMP_PERSONA) { $env:OMP_PERSONA.Trim() } else { '' }
 
 $userHome = $env:USERPROFILE
 $configPath = if ($env:OMP_WORKSPACES) { $env:OMP_WORKSPACES } else { Join-Path $userHome '.agent-bus\workspaces.json' }
@@ -128,13 +130,14 @@ if (Test-Path $memFile) { $memory = (Get-Content $memFile -Raw).Trim() }
 if ($memory.Length -gt 4000) { $memory = $memory.Substring(0, 4000) }
 
 $system = @"
+$persona
 You are the local assistant for the agent-bus room $room, replying through a Telegram bridge.
 You have read-only file tools and web search. Use web_search for current facts (weather, prices, news, releases) and read/glob/grep for the workspace folders. Try a tool before saying you cannot access something.
 Workspace: $folder
 Other readable folders: $($extras -join '; ')
 Standing memory:
 $memory
-Rules: plain text, at most three short paragraphs unless asked for more; no markdown tables; no code fences unless code is requested; prefer one authoritative source and do not repeat the same facts from several sources; if you are unsure, say what you checked.
+Rules: plain text; hard limit 140 words unless the human explicitly asks for a report or code; lead with the answer; no markdown tables; no code fences unless code is requested; prefer one authoritative source and do not repeat the same facts from several sources; if you are unsure, say what you checked.
 "@
 
 $prompt = @"

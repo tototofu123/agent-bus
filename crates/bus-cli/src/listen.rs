@@ -38,6 +38,14 @@ pub struct Config {
     pub reply_kind: String,
     pub timeout_s: u64,
     pub once: bool,
+    /// Handle used for `@mention` routing. Defaults to the agent id before `@`.
+    pub name: Option<String>,
+    /// Only answer messages that mention `name` (or any message with `--default`).
+    pub mention_only: bool,
+    /// With `--mention-only`, also answer messages that mention nobody.
+    pub default_reply: bool,
+    /// Only answer human surfaces, so agents cannot ping-pong off each other.
+    pub only_human: bool,
 }
 
 pub async fn run(cfg: Config, port: u16, transport: Transport) -> Result<()> {
@@ -50,6 +58,10 @@ pub async fn run(cfg: Config, port: u16, transport: Transport) -> Result<()> {
         reply_kind,
         timeout_s,
         once,
+        name,
+        mention_only,
+        default_reply,
+        only_human,
     } = cfg;
     if !room.starts_with('#') || room.len() > 64 || room.contains(char::is_whitespace) {
         return Err(anyhow!("room must be # prefixed, no whitespace"));
@@ -57,6 +69,17 @@ pub async fn run(cfg: Config, port: u16, transport: Transport) -> Result<()> {
     if exec.trim().is_empty() {
         return Err(anyhow!("--exec must not be empty"));
     }
+    // `assistant@bus` answers to `@assistant` unless told otherwise.
+    let name = name
+        .map(|n| n.trim_start_matches('@').to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| {
+            agent_id
+                .split('@')
+                .next()
+                .unwrap_or(&agent_id)
+                .to_string()
+        });
 
     let agent = make_agent(
         &agent_id,
@@ -82,15 +105,24 @@ pub async fn run(cfg: Config, port: u16, transport: Transport) -> Result<()> {
         return Err(anyhow!("tail rejected: {ack}"));
     }
     eprintln!(
-        "listen: {} answering {} in {} with `{}`",
+        "listen: {} ({}) answering {} in {} with `{}`{}",
         agent.id,
+        if mention_only {
+            format!(
+                "@{name}{}",
+                if default_reply { " + default" } else { "" }
+            )
+        } else {
+            "all messages".to_string()
+        },
         if kinds.is_empty() {
             "all kinds".to_string()
         } else {
             kinds.join(",")
         },
         room,
-        exec
+        exec,
+        if only_human { " (human only)" } else { "" }
     );
 
     let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
@@ -120,7 +152,7 @@ pub async fn run(cfg: Config, port: u16, transport: Transport) -> Result<()> {
                     continue;
                 }
                 let Some(value) = msg.get("envelope") else { continue };
-                let env: Envelope = match serde_json::from_value(value.clone()) {
+                let mut env: Envelope = match serde_json::from_value(value.clone()) {
                     Ok(env) => env,
                     Err(e) => {
                         eprintln!("listen: bad envelope: {e}");
@@ -130,6 +162,24 @@ pub async fn run(cfg: Config, port: u16, transport: Transport) -> Result<()> {
                 // Never answer ourselves: that is a feedback loop, not a reply.
                 if env.from.id == agent.id {
                     continue;
+                }
+                // Agents in a shared room must not answer each other, or two
+                // listeners trade replies forever. `--only-human` makes the
+                // group a human surface, not an agent-only echo room.
+                if only_human && !is_human(&env) {
+                    continue;
+                }
+                if mention_only {
+                    let mentions = mentions_of(env.text.as_deref().unwrap_or_default());
+                    let addressed = mentions.iter().any(|m| m.eq_ignore_ascii_case(&name));
+                    // A bare message reaches the default agent; a message that
+                    // names someone else reaches only that agent.
+                    if !addressed && !(default_reply && mentions.is_empty()) {
+                        continue;
+                    }
+                    if let Some(text) = &env.text {
+                        env.text = Some(strip_leading_mention(text, &name));
+                    }
                 }
                 match answer(&env, &exec, timeout_s, &reply_kind, &agent, &transport, port).await {
                     Ok(Some(seq)) => eprintln!(
@@ -254,6 +304,76 @@ fn shell_command(cmdline: &str) -> tokio::process::Command {
     c
 }
 
+/// True when the envelope came from a human surface. The bridge stamps
+/// `trust=human`; agent messages are `peer`, so the distinction is explicit
+/// rather than inferred from the id.
+fn is_human(env: &Envelope) -> bool {
+    matches!(env.trust, Some(proto::Trust::Human)) || env.from.is_human_surface()
+}
+
+/// Collect `@name` tokens for routing. A mention has to start the text or
+/// follow whitespace/punctuation, so `user@example.com` is not a mention.
+fn mentions_of(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let boundary = i == 0
+            || chars[i - 1].is_whitespace()
+            || matches!(
+                chars[i - 1],
+                '(' | '[' | '{' | '<' | ',' | ';' | ':' | '!' | '?'
+            );
+        if chars[i] == '@' && boundary {
+            let start = i + 1;
+            let mut j = start;
+            while j < chars.len()
+                && (chars[j].is_alphanumeric()
+                    || chars[j] == '_'
+                    || chars[j] == '.'
+                    || chars[j] == '-')
+            {
+                j += 1;
+            }
+            if j > start {
+                out.push(
+                    chars[start..j]
+                        .iter()
+                        .collect::<String>()
+                        .to_ascii_lowercase(),
+                );
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Drop a leading `@name` so the handler sees the actual question. Mentions in
+/// the middle of a sentence are left alone: they may be the content.
+fn strip_leading_mention(text: &str, name: &str) -> String {
+    let needle = format!("@{name}");
+    let mut rest = text.trim_start();
+    while let Some(head) = rest.get(..needle.len()) {
+        if !head.eq_ignore_ascii_case(&needle) {
+            break;
+        }
+        let after = &rest[needle.len()..];
+        let boundary = after
+            .chars()
+            .next()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        if !boundary {
+            break;
+        }
+        rest = after.trim_start();
+    }
+    rest.to_string()
+}
+
 /// Trim to the forwarding cap. Truncation is visible, not silent: a handler
 /// that dumps a novel should see that the tail was cut.
 fn cap_reply(text: &str) -> String {
@@ -297,5 +417,26 @@ mod tests {
         // A compile-time guard: `listen` depends on the shared client type, so
         // a future refactor that hides it must update this module too.
         fn _takes(_: &Client, _: &Transport) {}
+    }
+
+    #[test]
+    fn mentions_find_routing_targets() {
+        assert_eq!(mentions_of("@omp what is this"), vec!["omp"]);
+        assert_eq!(mentions_of("hey @Assistant, look"), vec!["assistant"]);
+        assert_eq!(mentions_of("@omp @assistant both"), vec!["omp", "assistant"]);
+        assert!(mentions_of("mail me at a@b.com").is_empty());
+        assert!(mentions_of("no mentions here").is_empty());
+    }
+
+    #[test]
+    fn leading_mention_is_stripped() {
+        assert_eq!(strip_leading_mention("@omp what is this", "omp"), "what is this");
+        assert_eq!(strip_leading_mention("@OMP   what", "omp"), "what");
+        assert_eq!(
+            strip_leading_mention("ask @omp about it", "omp"),
+            "ask @omp about it"
+        );
+        assert_eq!(strip_leading_mention("@assistant what", "omp"), "@assistant what");
+        assert_eq!(strip_leading_mention("@omplete nope", "omp"), "@omplete nope");
     }
 }
