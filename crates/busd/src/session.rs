@@ -7,7 +7,8 @@ use proto::{
     MAX_LINE_BYTES, OP_BYE, OP_ERROR, OP_HELLO, OP_SENT, OP_SENT_BATCH, OP_WELCOME, V,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use crate::TransportStream;
@@ -15,6 +16,14 @@ pub struct AppState {
     pub store: Store,
     pub router: Router,
     pub started: std::time::SystemTime,
+    /// Live connections per agent id. A count, not a flag: an agent commonly
+    /// holds a tail and one-shot send connections at the same time, and the
+    /// last one to close is what makes it offline.
+    ///
+    /// In memory on purpose. This is a property of *this broker process*, not
+    /// of the durable identity: after a restart every agent is offline until
+    /// it reconnects, which is the truthful answer.
+    pub presence: Mutex<HashMap<String, usize>>,
 }
 impl AppState {
     pub fn new(store: Store) -> AppState {
@@ -22,8 +31,44 @@ impl AppState {
             store,
             router: Router::new(),
             started: std::time::SystemTime::now(),
+            presence: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Record one live connection for `id`.
+    pub fn presence_join(&self, id: &str) {
+        if let Ok(mut p) = self.presence.lock() {
+            *p.entry(id.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// Drop one live connection for `id`, removing the entry at zero so a
+    /// disconnecting agent cannot leave a phantom behind.
+    pub fn presence_leave(&self, id: &str) {
+        if let Ok(mut p) = self.presence.lock() {
+            let gone = match p.get_mut(id) {
+                Some(n) if *n > 1 => {
+                    *n -= 1;
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
+            if gone {
+                p.remove(id);
+            }
+        }
+    }
+
+    /// How many live connections this agent currently holds.
+    pub fn presence_count(&self, id: &str) -> usize {
+        self.presence
+            .lock()
+            .ok()
+            .and_then(|p| p.get(id).copied())
+            .unwrap_or(0)
+    }
+
     // Warm the membership mirror from the DB (call once at boot).
     pub fn warm_members(&self) -> Result<()> {
         let rooms = self.store.rooms()?;
@@ -34,6 +79,20 @@ impl AppState {
             }
         }
         Ok(())
+    }
+}
+
+/// Releases an agent's presence slot when the connection ends, on every exit
+/// path including a protocol error or a dropped socket. Without the guard the
+/// early `?` returns in `handle_conn` would leave the agent permanently online.
+struct PresenceGuard {
+    state: Arc<AppState>,
+    id: String,
+}
+
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        self.state.presence_leave(&self.id);
     }
 }
 fn valid_room(name: &str) -> bool {
@@ -125,6 +184,15 @@ pub async fn handle_conn(stream: TransportStream, state: Arc<AppState>) -> Resul
         state.store.touch_agent(&agent.id).ok();
         me = Some(agent);
     }
+    // From here on this connection is a live sighting of the agent. The guard
+    // releases it however the function exits.
+    let _presence = me.as_ref().map(|a| {
+        state.presence_join(&a.id);
+        PresenceGuard {
+            state: state.clone(),
+            id: a.id.clone(),
+        }
+    });
     let cursor: Value = match &me {
         Some(a) => state
             .store
@@ -570,7 +638,16 @@ async fn op_history(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite
 }
 async fn op_who(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     let room = msg.get("room").and_then(|r| r.as_str());
-    let agents = state.store.who(room)?;
+    let mut agents = state.store.who(room)?;
+    // Presence is live state, so it is merged here rather than stored: the
+    // persisted row can only say when an agent was last seen, never whether it
+    // is connected right now.
+    for agent in &mut agents {
+        let id = agent.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+        let connections = state.presence_count(id);
+        agent["connections"] = json!(connections);
+        agent["online"] = json!(connections > 0);
+    }
     write(
         writer,
         &json!({"op": "who", "agents": agents, "count": agents.len()}),

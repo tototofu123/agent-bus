@@ -4,6 +4,7 @@
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -512,5 +513,62 @@ async fn ordering_many_senders_no_gaps() -> Result<()> {
             i + 1
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn who_shows_presence_and_room_metadata() -> Result<()> {
+    let server = start_server().await?;
+    let room = "#repo:live";
+
+    // Register once, then reconnect as the live session.
+    let mut first = Client::connect(server.port).await?;
+    let reg = first.register("live@demo", "codex-cli", Some("gpt-5-codex")).await?;
+    let token = reg["token"].as_str().expect("token").to_string();
+    drop(first);
+
+    let mut live = Client::connect(server.port).await?;
+    live.send(&agent_hello("live@demo", Some("gpt-5-codex"), Some(&token)))
+        .await?;
+    assert_eq!(live.read().await?["op"], "welcome");
+    live.op(json!({"op": "join", "room": room})).await?;
+
+    let mut obs = Client::connect(server.port).await?;
+    obs.send(&json!({"op": "hello", "v": 1})).await?;
+    assert_eq!(obs.read().await?["op"], "welcome");
+
+    let row = |who: &Value| -> Value {
+        who["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "live@demo")
+            .cloned()
+            .expect("agent listed")
+    };
+
+    let who = obs.op(json!({"op": "who", "room": room})).await?;
+    let a = row(&who);
+    assert_eq!(a["online"], true, "a live connection is online");
+    assert!(a["connections"].as_u64().unwrap() >= 1);
+    assert_eq!(a["rooms"][0], room);
+    assert!(
+        a["caps"].as_array().unwrap().iter().any(|c| c == "edit"),
+        "caps survive the who projection: {a}"
+    );
+
+    drop(live);
+    let mut offline = None;
+    for _ in 0..40 {
+        let who = obs.op(json!({"op": "who", "room": room})).await?;
+        let a = row(&who);
+        if a["online"] == false {
+            offline = Some(a);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let a = offline.expect("presence must clear when the socket closes");
+    assert_eq!(a["connections"], 0);
     Ok(())
 }

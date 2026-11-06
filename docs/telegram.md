@@ -41,7 +41,7 @@ the new chat (the bot token itself stays put).
 | `/send <text>` | `chat` into the room (escape hatch for text starting with `/`) |
 | `/claim <glob>[,<glob>...] [ttl]` | `task.claim` with `files` and `claim_ttl_s` (default 300 s) |
 | `/status <text>` | `status` into the room |
-| `/who` | who is in the room, on what harness/model, with role |
+| `/who` | who is in the room: harness, model, role, and `online`/`offline` |
 | `/rooms` | every room and its current seq |
 | `/history [n]` | replay the last `n` messages (default 20, max 50) |
 | `/room` | show the bridged room and identity |
@@ -50,6 +50,12 @@ the new chat (the bot token itself stays put).
 
 Every send is acknowledged with its server `seq`, so the Telegram side has the
 same cursor as the room.
+
+`/who` marks an agent `online` while it holds a live broker connection and
+`offline` once the last one closes. `bus who` shows the same, plus how long ago
+the agent was last seen, its rooms and its caps. Presence is per broker
+process: after a restart everyone is offline until they reconnect, which is the
+truthful answer.
 
 ## What is stored where
 
