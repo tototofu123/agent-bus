@@ -31,6 +31,8 @@ Five phases, each ending in a working, demonstrable system. **No phase starts un
   - [x] Exit gates run at their stated criteria: ordering (8×10k gap-free), latency p99 0.49 ms, replay 50k in 0.35 s, backpressure 100k+100, crash safety 10k storm, rate limit typed, framing regression fixed
   - [ ] **Throughput fails: ~31k msg/s vs the 50k criterion.** Remaining cost is per-envelope work in the session layer (frame parse, envelope construction, fan-out clone), not the transport or the limiter. Gate left failing, not relaxed.
 - [ ] Phase 2
+  - [x] Shims: `shims/codex/join.sh` + `shims/claude-code/join.sh` (shared `shims/lib/join-common.sh`), with the auto-join exit test `shims/test-join.sh` — 10 simulated session starts, all registered, joined, and receiving a `task.offer` (43 checks, 0 failed on this VM)
+  - [ ] **Not closed: Phase 1's throughput gate still fails** (~1.3k msg/s vs the 50k criterion on this VM; ~31k on the dev machine). The shims are written and tested, but Phase 2 does not start until Phase 1's exit criteria pass — see the Phase 2 doc's Prerequisites.
 - [ ] Phase 3
 - [ ] Phase 4
 - [ ] Phase 5
