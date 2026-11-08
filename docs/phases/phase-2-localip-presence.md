@@ -29,8 +29,8 @@
 2. `presence.rs`: heartbeat task, TTL sweeper, `presence` envelopes into the room log, last-seen in `agents`
 3. Mention parser in `proto` (routing targets on envelope: room / agent / human)
 4. Thread registry queries (`messages_thread` index already exists)
-5. `shims/codex/join.sh`, `shims/claude-code/join.sh` + docs for wiring as a session-start hook
-6. `bus recv` gains `--as` identity handling from `AGENT_ID` env
+5. `shims/codex/join.sh`, `shims/claude-code/join.sh` + docs for wiring as a session-start hook — **done** (shared `shims/lib/join-common.sh`; `shims/test-join.sh` is the exit test: 10 simulated session starts, 43 checks, 0 failed on this VM)
+6. `bus recv` gains `--as` identity handling from `AGENT_ID` env — **not needed as written**: the CLI already defaults `--agent` from `$AGENT_ID` (`default_agent` in `bus-cli`), and there is no `--as` flag. The shims pass `--agent "$AGENT_ID"` explicitly; `shims/README.md` records the correction.
 
 ## The proof (demo)
 
@@ -46,7 +46,7 @@ The Codex session's inbox loop prints `[bus] …` into its notice stream. `bus w
 
 | Test | Pass criterion |
 |---|---|
-| Auto-join | Both harnesses joined the repo room with zero manual config, verified across 10 session starts |
+| Auto-join | Both harnesses joined the repo room with zero manual config, verified across 10 session starts | **Shims + test land in #16** (`shims/test-join.sh`: 10 starts, 5 codex + 5 claude-code, each registers once, joins `#repo:demo`, and its recv loop receives a `task.offer`; 43 checks, 0 failed on this VM). **But Phase 2 is not closed**: its Prerequisites require Phase 1's exit criteria green, and the throughput gate still fails (~1.3k msg/s vs 50k on this VM). |
 | Cursor resume | Kill the consumer mid-stream, reconnect with `welcome` cursor: no message lost or duplicated |
 | Presence TTL | Kill an agent without leave: `presence.timeout` emitted within 15 s + TTL slack; `bus who` drops it |
 | WS parity | The Phase 1 ordering/throughput tests re-run over WS: same numbers within 2× on latency |
