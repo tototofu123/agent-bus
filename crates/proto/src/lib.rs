@@ -8,6 +8,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod schedule;
+
 pub const V: u32 = 1;
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 
@@ -130,6 +132,18 @@ impl Role {
     /// owning a migration.
     pub fn assign(agent: &Agent) -> Role {
         let harness = agent.harness.to_ascii_lowercase();
+        // The scheduler is a timer, not a model: it posts only user-authored
+        // schedule entries and never reasons, summarises, or claims, so it
+        // cannot honestly declare a model — yet it must post `task.offer`.
+        // The broker grants harness "scheduler" the Conversation role
+        // explicitly, enough to post `task.offer` and nothing more (it still
+        // may not send `policy`, which is human-only). See
+        // docs/scheduling.md. The match is exact: a harness merely
+        // containing "scheduler" does not earn the role, and no other
+        // harness's rule changes.
+        if harness == "scheduler" {
+            return Role::Conversation;
+        }
         let script =
             harness.contains("script") || harness.contains("sh") || harness.contains("curl");
         match (agent.model.as_deref(), script) {
@@ -588,6 +602,45 @@ mod tests {
             ..script.clone()
         };
         assert_eq!(Role::assign(&big), Role::Peer);
+    }
+
+    #[test]
+    fn role_assign_scheduler_harness() {
+        // The scheduler is a timer, not a model: harness "scheduler" earns
+        // Conversation explicitly, with or without a model — enough to post
+        // task.offer, and never Peer (it never reasons end-to-end).
+        let sched = Agent {
+            id: "scheduler@bus".into(),
+            harness: "scheduler".into(),
+            model: None,
+            session: None,
+            cwd: None,
+            caps: vec![],
+        };
+        assert_eq!(Role::assign(&sched), Role::Conversation);
+
+        let sched_modelled = Agent {
+            model: Some("llama-3-70b".into()),
+            ..sched.clone()
+        };
+        assert_eq!(Role::assign(&sched_modelled), Role::Conversation);
+
+        // Case-insensitive, but exact: a harness merely containing the word
+        // does not earn the role.
+        let sched_upper = Agent {
+            harness: "Scheduler".into(),
+            ..sched.clone()
+        };
+        assert_eq!(Role::assign(&sched_upper), Role::Conversation);
+        let sched_like = Agent {
+            harness: "my-scheduler".into(),
+            ..sched.clone()
+        };
+        assert_eq!(Role::assign(&sched_like), Role::Protocol);
+
+        // And the scheduler may post task.offer but never policy.
+        assert!(Role::Conversation.allowed(&Kind::TaskOffer));
+        assert!(!Role::Conversation.allowed(&Kind::Policy));
     }
 
     #[test]

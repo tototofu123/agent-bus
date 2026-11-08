@@ -1,6 +1,7 @@
 // Per-connection protocol state machine: handshake, then one op per line.
 use crate::router::Router;
 use crate::store::{broker_envelope, Store};
+use crate::TransportStream;
 use anyhow::{anyhow, Result};
 use proto::{
     decode_line, encode_line, hash_token, new_token, Agent, Envelope, Kind, Role, Trust,
@@ -10,7 +11,6 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use crate::TransportStream;
 pub struct AppState {
     pub store: Store,
     pub router: Router,
@@ -157,6 +157,18 @@ pub async fn handle_conn(stream: TransportStream, state: Arc<AppState>) -> Resul
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
         }                    }                    "rooms" => {                        if let Err(e) = op_rooms(&state, &mut writer).await {
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "schedule.add" => {                        if let Err(e) = op_schedule_add(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "schedule.list" => {                        if let Err(e) = op_schedule_list(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "schedule.remove" => {                        if let Err(e) = op_schedule_remove(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "schedule.enable" => {                        if let Err(e) = op_schedule_enable(&state, &me, &msg, &mut writer, true).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "schedule.disable" => {                        if let Err(e) = op_schedule_enable(&state, &me, &msg, &mut writer, false).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "schedule.tick" => {                        if let Err(e) = op_schedule_tick(&state, &me, &msg, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
         }                    }                    "tail" => {                        let rooms: Option<std::collections::HashSet<String>> = msg                            .get("rooms")                            .and_then(|r| r.as_array())                            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect());                        let kinds: Option<std::collections::HashSet<String>> = msg                            .get("kinds")                            .and_then(|k| k.as_array())                            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect());                        let (id, rx) = state.router.subscribe_tail(rooms, kinds);                        tail_id = Some(id);                        tail_rx = Some(rx);                        write(&mut writer, &json!({"op": "tail", "ok": true})).await?;                    }                    other => {                        write(&mut writer, &err_value("op", format!("unknown op {other:?}"))).await?;                    }                }            }            ev = async { match tail_rx.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => {                if let Some(env) = ev {                    write(&mut writer, &json!({"op": "msg", "envelope": env})).await?;                }            }        }
     }
     if let Some(id) = tail_id {
@@ -169,7 +181,11 @@ async fn write<W: AsyncWrite + Unpin>(w: &mut W, v: &Value) -> Result<()> {
     w.flush().await?;
     Ok(())
 }
-async fn op_register(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+async fn op_register(
+    state: &AppState,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
     let agent: Agent = match msg
         .get("agent")
         .and_then(|a| serde_json::from_value(a.clone()).ok())
@@ -359,7 +375,10 @@ async fn op_send(
     let Some(seq) = state.store.append_from_registered(&mut env, kind)? else {
         write(
             writer,
-            &err_value("auth", "anonymous@bus has not registered; run `bus register` first"),
+            &err_value(
+                "auth",
+                "anonymous@bus has not registered; run `bus register` first",
+            ),
         )
         .await?;
         return Ok(());
@@ -437,7 +456,10 @@ async fn op_send_batch(
     if items.len() > proto::MAX_BATCH {
         write(
             writer,
-            &err_value("payload", format!("send_batch over {} messages", proto::MAX_BATCH)),
+            &err_value(
+                "payload",
+                format!("send_batch over {} messages", proto::MAX_BATCH),
+            ),
         )
         .await?;
         return Ok(());
@@ -479,7 +501,10 @@ async fn op_send_batch(
     let Some(seqs) = state.store.append_batch(&mut built)? else {
         write(
             writer,
-            &err_value("auth", "anonymous@bus has not registered; run `bus register` first"),
+            &err_value(
+                "auth",
+                "anonymous@bus has not registered; run `bus register` first",
+            ),
         )
         .await?;
         return Ok(());
@@ -520,7 +545,11 @@ async fn op_recv(
     }
     Ok(())
 }
-async fn op_history(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+async fn op_history(
+    state: &AppState,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
     let Some(room) = msg.get("room").and_then(|r| r.as_str()) else {
         write(writer, &err_value("payload", "history requires room")).await?;
         return Ok(());
@@ -539,7 +568,11 @@ async fn op_history(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite
     .await?;
     Ok(())
 }
-async fn op_who(state: &AppState, msg: &Value, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+async fn op_who(
+    state: &AppState,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
     let room = msg.get("room").and_then(|r| r.as_str());
     let agents = state.store.who(room)?;
     write(
@@ -554,6 +587,243 @@ async fn op_rooms(state: &AppState, writer: &mut (impl AsyncWrite + Unpin)) -> R
     write(
         writer,
         &json!({"op": "rooms", "rooms": rooms, "count": rooms.len()}),
+    )
+    .await?;
+    Ok(())
+}
+
+// -- scheduled jobs ---------------------------------------------------------
+
+/// Shared preamble for the schedule-management ops: a registered agent.
+/// (The tick has its own handler — it additionally requires a role that
+/// may send `task.offer`.)
+async fn require_schedule_agent(
+    state: &AppState,
+    me: &Option<Agent>,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<Option<Agent>> {
+    let Some(agent) = me else {
+        write(
+            writer,
+            &err_value("proto", "hello with agent required first"),
+        )
+        .await?;
+        return Ok(None);
+    };
+    if !require_registered(state, &agent.id, writer).await? {
+        return Ok(None);
+    }
+    Ok(Some(agent.clone()))
+}
+
+async fn op_schedule_add(
+    state: &AppState,
+    me: &Option<Agent>,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    if require_schedule_agent(state, me, writer).await?.is_none() {
+        return Ok(());
+    }
+    let Some(name) = msg
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+    else {
+        write(
+            writer,
+            &err_value("payload", "schedule.add requires a non-empty name"),
+        )
+        .await?;
+        return Ok(());
+    };
+    let Some(room) = msg.get("room").and_then(|r| r.as_str()).map(String::from) else {
+        write(writer, &err_value("payload", "schedule.add requires room")).await?;
+        return Ok(());
+    };
+    if !valid_room(&room) {
+        write(
+            writer,
+            &err_value("payload", "room must be # prefixed, no whitespace"),
+        )
+        .await?;
+        return Ok(());
+    }
+    let Some(cron) = msg.get("cron").and_then(|c| c.as_str()).map(String::from) else {
+        write(writer, &err_value("payload", "schedule.add requires cron")).await?;
+        return Ok(());
+    };
+    if let Err(e) = proto::schedule::parse_cron(&cron) {
+        write(writer, &err_value("payload", format!("bad cron: {e}"))).await?;
+        return Ok(());
+    }
+    let timezone = msg
+        .get("timezone")
+        .and_then(|t| t.as_str())
+        .unwrap_or("local")
+        .to_string();
+    if let Err(e) = proto::schedule::resolve_tz(&timezone) {
+        write(writer, &err_value("payload", format!("bad timezone: {e}"))).await?;
+        return Ok(());
+    }
+    let payload = msg.get("payload").cloned().unwrap_or(json!({}));
+    if let Err(e) = proto::schedule::validate_offer_payload(&payload) {
+        write(writer, &err_value("payload", format!("bad payload: {e}"))).await?;
+        return Ok(());
+    }
+    if state.store.get_schedule(&name)?.is_some() {
+        write(
+            writer,
+            &err_value("payload", format!("schedule {name:?} already exists")),
+        )
+        .await?;
+        return Ok(());
+    }
+    let entry = proto::schedule::ScheduleEntry {
+        name: name.clone(),
+        room,
+        cron,
+        timezone,
+        text: msg
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
+        payload,
+        enabled: msg.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
+        created_at_ms: crate::store::now_ms(),
+        last_fired_ms: None,
+    };
+    state.store.add_schedule(&entry)?;
+    write(writer, &json!({"op": "schedule.added", "schedule": entry})).await?;
+    Ok(())
+}
+
+async fn op_schedule_list(
+    state: &AppState,
+    me: &Option<Agent>,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    if require_schedule_agent(state, me, writer).await?.is_none() {
+        return Ok(());
+    }
+    let room = msg.get("room").and_then(|r| r.as_str());
+    let schedules = state.store.list_schedules(room)?;
+    write(
+        writer,
+        &json!({"op": "schedule.list", "schedules": schedules, "count": schedules.len()}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn op_schedule_remove(
+    state: &AppState,
+    me: &Option<Agent>,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    if require_schedule_agent(state, me, writer).await?.is_none() {
+        return Ok(());
+    }
+    let Some(name) = msg.get("name").and_then(|n| n.as_str()) else {
+        write(
+            writer,
+            &err_value("payload", "schedule.remove requires name"),
+        )
+        .await?;
+        return Ok(());
+    };
+    if !state.store.remove_schedule(name)? {
+        write(
+            writer,
+            &err_value("payload", format!("no schedule named {name:?}")),
+        )
+        .await?;
+        return Ok(());
+    }
+    write(writer, &json!({"op": "schedule.removed", "name": name})).await?;
+    Ok(())
+}
+
+async fn op_schedule_enable(
+    state: &AppState,
+    me: &Option<Agent>,
+    msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+    enabled: bool,
+) -> Result<()> {
+    if require_schedule_agent(state, me, writer).await?.is_none() {
+        return Ok(());
+    }
+    let Some(name) = msg.get("name").and_then(|n| n.as_str()) else {
+        write(
+            writer,
+            &err_value("payload", "schedule.enable/disable requires name"),
+        )
+        .await?;
+        return Ok(());
+    };
+    if !state.store.set_schedule_enabled(name, enabled)? {
+        write(
+            writer,
+            &err_value("payload", format!("no schedule named {name:?}")),
+        )
+        .await?;
+        return Ok(());
+    }
+    write(
+        writer,
+        &json!({"op": if enabled { "schedule.enabled" } else { "schedule.disabled" }, "name": name, "enabled": enabled}),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The tick: fire every due schedule once, as the calling agent. The
+/// caller must be registered and hold a role that may send `task.offer`
+/// — in practice the `scheduler@bus` identity (harness `scheduler`,
+/// Conversation by the explicit rule in `Role::assign`). The offers are
+/// posted through the same append path as `bus send` (same role and
+/// payload validation, same seq assignment), then fanned out to room
+/// members and live tails.
+async fn op_schedule_tick(
+    state: &AppState,
+    me: &Option<Agent>,
+    _msg: &Value,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    let Some(agent) = require_schedule_agent(state, me, writer).await? else {
+        return Ok(());
+    };
+    let role = state.store.agent_role(&agent.id)?.unwrap_or(Role::Protocol);
+    if !role.allowed(&Kind::TaskOffer) {
+        write(
+            writer,
+            &err_value(
+                "role",
+                format!(
+                    "role {role:?} may not send task.offer; run the tick as scheduler@bus (register --harness scheduler)"
+                ),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    let outcome = state.store.tick_schedules(&agent, crate::store::now_ms())?;
+    for f in &outcome.fired {
+        state.router.fan_out(&f.env);
+    }
+    write(
+        writer,
+        &json!({
+            "op": "schedule.tick",
+            "fired": outcome.fired.iter().map(|f| f.schedule.clone()).collect::<Vec<_>>(),
+            "skipped": outcome.skipped.iter().map(|(n, r)| json!({"name": n, "reason": r})).collect::<Vec<_>>(),
+            "count": outcome.fired.len(),
+        }),
     )
     .await?;
     Ok(())

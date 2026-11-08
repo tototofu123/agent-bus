@@ -51,6 +51,8 @@ enum Cmd {
     Rooms,
     /// Replay a room from a cursor
     History(HistoryArgs),
+    /// Manage scheduled jobs (cron posts task.offer into rooms)
+    Schedule(ScheduleArgs),
 }
 
 #[derive(Args)]
@@ -163,6 +165,78 @@ struct HistoryArgs {
     /// print full envelopes as JSON lines
     #[arg(long)]
     full: bool,
+}
+
+#[derive(Args)]
+struct ScheduleArgs {
+    #[command(subcommand)]
+    cmd: ScheduleCmd,
+}
+
+#[derive(Subcommand)]
+enum ScheduleCmd {
+    /// Add a schedule: posts a task.offer into a room on a cron
+    Add(ScheduleAddArgs),
+    /// List schedules
+    List(ScheduleListArgs),
+    /// Remove a schedule by name
+    Remove(ScheduleNameArgs),
+    /// Enable a schedule by name
+    Enable(ScheduleNameArgs),
+    /// Disable a schedule by name
+    Disable(ScheduleNameArgs),
+    /// Run one tick: fire every due schedule once (run by an external timer each minute)
+    Tick(ScheduleTickArgs),
+}
+
+#[derive(Args)]
+struct ScheduleAddArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    room: String,
+    /// cron: 5-field crontab, 6/7-field, or @daily/@weekly/@monthly/@yearly
+    #[arg(long)]
+    cron: String,
+    #[arg(long, default_value = "")]
+    text: String,
+    /// comma-separated file globs for the task.offer payload (may be empty)
+    #[arg(long, value_delimiter = ',')]
+    files: Vec<String>,
+    /// extra JSON object merged into the task.offer payload
+    #[arg(long)]
+    payload: Option<String>,
+    /// timezone: local (default), UTC, or an IANA name like Asia/Hong_Kong
+    #[arg(long, default_value = "local")]
+    timezone: String,
+    /// create the schedule disabled
+    #[arg(long)]
+    disabled: bool,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct ScheduleListArgs {
+    #[arg(long)]
+    room: Option<String>,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct ScheduleNameArgs {
+    #[arg(long)]
+    name: String,
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args)]
+struct ScheduleTickArgs {
+    /// identity that runs the tick (default scheduler@bus)
+    #[arg(long)]
+    agent: Option<String>,
 }
 
 fn port(cli_port: Option<u16>) -> u16 {
@@ -310,7 +384,6 @@ impl Client {
             Stream::Pipe(s) => Client::Pipe(s),
         }
     }
-
 
     async fn send_raw(&mut self, v: &Value) -> Result<()> {
         match self {
@@ -581,16 +654,20 @@ async fn run(cli: Cli) -> Result<()> {
             let raw = if a.file == "-" {
                 use std::io::Read as _;
                 let mut s = String::new();
-                std::io::stdin().read_to_string(&mut s).context("read stdin")?;
+                std::io::stdin()
+                    .read_to_string(&mut s)
+                    .context("read stdin")?;
                 s
             } else {
-                std::fs::read_to_string(&a.file)
-                    .with_context(|| format!("read {}", a.file))?
+                std::fs::read_to_string(&a.file).with_context(|| format!("read {}", a.file))?
             };
             let messages: Value = serde_json::from_str(&raw)
                 .context("batch file must be a JSON array of message objects")?;
             if !messages.is_array() {
-                anyhow::bail!("batch file must be a JSON array, got {}", messages_kind(&messages));
+                anyhow::bail!(
+                    "batch file must be a JSON array, got {}",
+                    messages_kind(&messages)
+                );
             }
             if messages.as_array().map(|a| a.len()).unwrap_or(0) == 0 {
                 anyhow::bail!("batch file has no messages");
@@ -604,8 +681,18 @@ async fn run(cli: Cli) -> Result<()> {
             println!(
                 "sent_batch {} messages, seqs {}..{}",
                 reply.get("count").and_then(|n| n.as_u64()).unwrap_or(0),
-                reply.get("seqs").and_then(|s| s.as_array()).and_then(|s| s.first()).and_then(|n| n.as_i64()).unwrap_or(0),
-                reply.get("seqs").and_then(|s| s.as_array()).and_then(|s| s.last()).and_then(|n| n.as_i64()).unwrap_or(0),
+                reply
+                    .get("seqs")
+                    .and_then(|s| s.as_array())
+                    .and_then(|s| s.first())
+                    .and_then(|n| n.as_i64())
+                    .unwrap_or(0),
+                reply
+                    .get("seqs")
+                    .and_then(|s| s.as_array())
+                    .and_then(|s| s.last())
+                    .and_then(|n| n.as_i64())
+                    .unwrap_or(0),
             );
         }
         Cmd::Recv(a) => {
@@ -828,6 +915,159 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Schedule(a) => match a.cmd {
+            ScheduleCmd::Add(a) => {
+                // Fail fast locally: a bad cron, timezone, or payload is a
+                // CLI error, not a broker round-trip.
+                proto::schedule::parse_cron(&a.cron).map_err(|e| anyhow!("bad cron: {e}"))?;
+                proto::schedule::resolve_tz(&a.timezone)
+                    .map_err(|e| anyhow!("bad timezone: {e}"))?;
+                let mut payload = match &a.payload {
+                    Some(p) => {
+                        let v: Value = serde_json::from_str(p)
+                            .context("payload must be a valid JSON object")?;
+                        if !v.is_object() {
+                            anyhow::bail!(
+                                "payload must be a JSON object, got {}",
+                                messages_kind(&v)
+                            );
+                        }
+                        v
+                    }
+                    None => json!({}),
+                };
+                if payload.get("files").is_some() {
+                    anyhow::bail!("pass files with --files, not inside --payload");
+                }
+                payload["files"] = json!(a.files);
+                proto::schedule::validate_offer_payload(&payload)
+                    .map_err(|e| anyhow!("bad payload: {e}"))?;
+
+                let id = default_agent(a.agent);
+                let agent = make_agent(&id, "bus-cli", None, &[], None);
+                let token = read_token(&id);
+                c.hello(Some(&agent), token.as_deref()).await?;
+                let reply = c
+                    .op(json!({
+                        "op": "schedule.add",
+                        "name": a.name, "room": a.room, "cron": a.cron,
+                        "timezone": a.timezone, "text": a.text,
+                        "payload": payload, "enabled": !a.disabled,
+                    }))
+                    .await?;
+                c.bye().await;
+                let s = reply.get("schedule").cloned().unwrap_or(json!({}));
+                println!(
+                    "added schedule {} -> {} cron={} tz={} enabled={}",
+                    s.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
+                    s.get("room").and_then(|r| r.as_str()).unwrap_or("?"),
+                    s.get("cron").and_then(|x| x.as_str()).unwrap_or("?"),
+                    s.get("timezone").and_then(|t| t.as_str()).unwrap_or("?"),
+                    s.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
+                );
+            }
+            ScheduleCmd::List(a) => {
+                let id = default_agent(a.agent);
+                let agent = make_agent(&id, "bus-cli", None, &[], None);
+                let token = read_token(&id);
+                c.hello(Some(&agent), token.as_deref()).await?;
+                let mut v = json!({"op": "schedule.list"});
+                if let Some(r) = &a.room {
+                    v["room"] = r.as_str().into();
+                }
+                let reply = c.op(v).await?;
+                c.bye().await;
+                if let Some(list) = reply.get("schedules").and_then(|s| s.as_array()) {
+                    for s in list {
+                        println!(
+                            "{:<24} {:<28} cron={:<22} tz={:<16} enabled={:<5} last_fired={}",
+                            s.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
+                            s.get("room").and_then(|r| r.as_str()).unwrap_or("?"),
+                            s.get("cron").and_then(|x| x.as_str()).unwrap_or("?"),
+                            s.get("timezone").and_then(|t| t.as_str()).unwrap_or("?"),
+                            s.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true),
+                            s.get("last_fired_ms")
+                                .and_then(|l| l.as_i64())
+                                .map(|m| m.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                        );
+                    }
+                    if list.is_empty() {
+                        println!("(no schedules)");
+                    }
+                }
+            }
+            ScheduleCmd::Remove(a) => {
+                let id = default_agent(a.agent);
+                let agent = make_agent(&id, "bus-cli", None, &[], None);
+                let token = read_token(&id);
+                c.hello(Some(&agent), token.as_deref()).await?;
+                c.op(json!({"op": "schedule.remove", "name": a.name}))
+                    .await?;
+                c.bye().await;
+                println!("removed schedule {}", a.name);
+            }
+            ScheduleCmd::Enable(a) => {
+                let id = default_agent(a.agent);
+                let agent = make_agent(&id, "bus-cli", None, &[], None);
+                let token = read_token(&id);
+                c.hello(Some(&agent), token.as_deref()).await?;
+                c.op(json!({"op": "schedule.enable", "name": a.name}))
+                    .await?;
+                c.bye().await;
+                println!("enabled schedule {}", a.name);
+            }
+            ScheduleCmd::Disable(a) => {
+                let id = default_agent(a.agent);
+                let agent = make_agent(&id, "bus-cli", None, &[], None);
+                let token = read_token(&id);
+                c.hello(Some(&agent), token.as_deref()).await?;
+                c.op(json!({"op": "schedule.disable", "name": a.name}))
+                    .await?;
+                c.bye().await;
+                println!("disabled schedule {}", a.name);
+            }
+            ScheduleCmd::Tick(a) => {
+                // The tick runs as the scheduler identity (registered once
+                // with `bus register --agent scheduler@bus --harness
+                // scheduler`); $AGENT_ID or --agent overrides it.
+                let id = a
+                    .agent
+                    .or_else(|| std::env::var("AGENT_ID").ok())
+                    .unwrap_or_else(|| "scheduler@bus".into());
+                let agent = make_agent(&id, "scheduler", None, &[], None);
+                let token = read_token(&id);
+                c.hello(Some(&agent), token.as_deref()).await?;
+                let reply = c.op(json!({"op": "schedule.tick"})).await?;
+                c.bye().await;
+                let fired = reply
+                    .get("fired")
+                    .and_then(|f| f.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if fired == 0 {
+                    println!("tick: nothing due");
+                } else {
+                    for f in reply
+                        .get("fired")
+                        .and_then(|f| f.as_array())
+                        .into_iter()
+                        .flatten()
+                    {
+                        println!("tick: fired {}", f.as_str().unwrap_or("?"));
+                    }
+                }
+                if let Some(skipped) = reply.get("skipped").and_then(|s| s.as_array()) {
+                    for s in skipped {
+                        eprintln!(
+                            "tick: skipped {} ({})",
+                            s.get("name").and_then(|n| n.as_str()).unwrap_or("?"),
+                            s.get("reason").and_then(|r| r.as_str()).unwrap_or("?"),
+                        );
+                    }
+                }
+            }
+        },
     }
     Ok(())
 }

@@ -105,6 +105,13 @@ Roles are assigned by the broker at registration (from declared model + harness)
 
 Rejection is typed and public: a `protocol`-role agent sending `task.claim` gets `deny{reason:"role_protocol_cannot_claim"}` and the room sees a one-line note. Unknown model size defaults to the weakest non-transport role — guessing upward is how a mislabelled 1B ends up owning a migration.
 
+The one exception to the model floors is the `scheduler` harness: it is a
+timer, not a model, so it declares no model — yet it must post
+`task.offer`. The broker grants harness `scheduler` the Conversation
+role explicitly. It posts only user-authored schedule entries and never
+reasons, so it earns Conversation and nothing more; it still may not
+send `policy`. See [docs/scheduling.md](docs/scheduling.md).
+
 ## Ordering & delivery
 
 - **Single writer per room** → the sequencer is the only writer of a room's `seq`; ordering is trivial and gap-free.
