@@ -90,6 +90,17 @@ impl Store {
                bytes     INTEGER NOT NULL,
                stored_at INTEGER NOT NULL,
                data      BLOB
+             );
+             CREATE TABLE IF NOT EXISTS schedules (
+               name       TEXT PRIMARY KEY,
+               room       TEXT NOT NULL,
+               cron       TEXT NOT NULL,
+               timezone   TEXT NOT NULL DEFAULT 'local',
+               text       TEXT NOT NULL DEFAULT '',
+               payload    TEXT NOT NULL DEFAULT '{}',
+               enabled    INTEGER NOT NULL DEFAULT 1,
+               created_at INTEGER NOT NULL,
+               last_fired INTEGER
              );",
         )
         .context("migrations")?;
@@ -305,6 +316,105 @@ impl Store {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    // -- schedules ------------------------------------------------------------
+
+    fn row_to_schedule(r: &rusqlite::Row) -> rusqlite::Result<proto::schedule::ScheduleEntry> {
+        // A payload that no longer parses as JSON is kept visible (as an
+        // empty object) rather than dropping the row from listings: the
+        // tick then rejects it as an invalid payload and reports it, and
+        // the schedule stays removable.
+        let payload_raw: String = r.get(5)?;
+        let payload = serde_json::from_str(&payload_raw).unwrap_or_else(|_| serde_json::json!({}));
+        Ok(proto::schedule::ScheduleEntry {
+            name: r.get(0)?,
+            room: r.get(1)?,
+            cron: r.get(2)?,
+            timezone: r.get(3)?,
+            text: r.get(4)?,
+            payload,
+            enabled: r.get::<_, i64>(6)? != 0,
+            created_at_ms: r.get(7)?,
+            last_fired_ms: r.get(8)?,
+        })
+    }
+
+    pub fn add_schedule(&self, e: &proto::schedule::ScheduleEntry) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO schedules (name, room, cron, timezone, text, payload, enabled, created_at, last_fired)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                e.name,
+                e.room,
+                e.cron,
+                e.timezone,
+                e.text,
+                serde_json::to_string(&e.payload)?,
+                e.enabled as i64,
+                e.created_at_ms,
+                e.last_fired_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_schedule(&self, name: &str) -> Result<Option<proto::schedule::ScheduleEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, room, cron, timezone, text, payload, enabled, created_at, last_fired
+             FROM schedules WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], Self::row_to_schedule)?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_schedules(
+        &self,
+        room: Option<&str>,
+    ) -> Result<Vec<proto::schedule::ScheduleEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let sql = match room {
+            Some(_) => {
+                "SELECT name, room, cron, timezone, text, payload, enabled, created_at, last_fired
+                 FROM schedules WHERE room = ?1 ORDER BY name"
+            }
+            None => {
+                "SELECT name, room, cron, timezone, text, payload, enabled, created_at, last_fired
+                 FROM schedules ORDER BY name"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = match room {
+            Some(room) => {
+                let rows = stmt.query_map(params![room], Self::row_to_schedule)?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
+            None => {
+                let rows = stmt.query_map([], Self::row_to_schedule)?;
+                rows.filter_map(|r| r.ok()).collect()
+            }
+        };
+        Ok(rows)
+    }
+
+    pub fn remove_schedule(&self, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute("DELETE FROM schedules WHERE name = ?1", params![name])?;
+        Ok(n > 0)
+    }
+
+    pub fn set_schedule_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "UPDATE schedules SET enabled = ?1 WHERE name = ?2",
+            params![enabled as i64, name],
+        )?;
+        Ok(n > 0)
+    }
+
     // -- append (the sequencer) ---------------------------------------------
 
     /// Assign the next `seq` and insert, in one transaction that commits
@@ -380,10 +490,7 @@ impl Store {
     ///
     /// Validates the sender once and rejects the whole batch if it is not
     /// registered, matching the single-send behaviour.
-    pub fn append_batch(
-        &self,
-        envs: &mut [(Envelope, Kind)],
-    ) -> Result<Option<Vec<i64>>> {
+    pub fn append_batch(&self, envs: &mut [(Envelope, Kind)]) -> Result<Option<Vec<i64>>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let sender = envs.first().map(|(e, _)| e.from.id.clone());
@@ -472,6 +579,88 @@ impl Store {
             .filter_map(|s| serde_json::from_str(&s).ok())
             .collect())
     }
+
+    /// One tick: for every enabled schedule whose next occurrence after
+    /// its last fire (or creation) is due within the last minute, post its
+    /// `task.offer` and record the occurrence as last-fired.
+    ///
+    /// Atomicity is what makes a tick idempotent within a minute: the
+    /// whole tick holds the store lock, and each schedule's due-check +
+    /// append + last-fired update runs inside one transaction, so two
+    /// ticks (or a tick and a manual send) can never double-fire a
+    /// schedule. A malformed schedule (bad cron, bad timezone, bad
+    /// payload) is skipped and reported, never crashing the tick and
+    /// never blocking the other schedules.
+    ///
+    /// Returns the fired envelopes — the caller fans them out to room
+    /// members and live tails after the commit — and the per-schedule
+    /// skip reasons for the tick reply.
+    pub fn tick_schedules(&self, agent: &Agent, now_ms: i64) -> Result<TickOutcome> {
+        let mut conn = self.conn.lock().unwrap();
+        let entries: Vec<proto::schedule::ScheduleEntry> = {
+            let mut stmt = conn.prepare(
+                "SELECT name, room, cron, timezone, text, payload, enabled, created_at, last_fired
+                 FROM schedules WHERE enabled != 0 ORDER BY name",
+            )?;
+            let rows = stmt.query_map([], Self::row_to_schedule)?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        let mut fired = Vec::new();
+        let mut skipped = Vec::new();
+        for entry in entries {
+            let due = match proto::schedule::due_occurrence(&entry, now_ms) {
+                Ok(Some(t)) => t,
+                Ok(None) => continue, // not due yet
+                Err(e) => {
+                    skipped.push((entry.name.clone(), format!("bad schedule: {e}")));
+                    continue;
+                }
+            };
+            if let Err(e) = proto::schedule::validate_offer_payload(&entry.payload) {
+                skipped.push((entry.name.clone(), format!("bad payload: {e}")));
+                continue;
+            }
+            let mut env = Envelope::new(&entry.room, agent.clone(), Kind::TaskOffer);
+            if !entry.text.is_empty() {
+                env.text = Some(entry.text.clone());
+            }
+            env.payload = Some(entry.payload.clone());
+            // One transaction: ensure the room, append the offer, record
+            // the occurrence as last-fired. The store lock is held for
+            // the whole tick, so no other tick can interleave.
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT OR IGNORE INTO rooms (name, opened) VALUES (?1, ?2)",
+                params![entry.room, now_ms],
+            )?;
+            let seq = self.assign_and_insert(&tx, &mut env, Kind::TaskOffer)?;
+            tx.execute(
+                "UPDATE schedules SET last_fired = ?1 WHERE name = ?2",
+                params![due, entry.name],
+            )?;
+            tx.commit()?;
+            fired.push(TickFired {
+                schedule: entry.name,
+                env,
+                seq,
+            });
+        }
+        Ok(TickOutcome { fired, skipped })
+    }
+}
+
+/// One schedule fired by a tick: its name, the posted envelope, and the
+/// room seq the offer was assigned.
+pub struct TickFired {
+    pub schedule: String,
+    pub env: Envelope,
+    pub seq: i64,
+}
+
+/// The result of one tick: what fired, and what was skipped (with reasons).
+pub struct TickOutcome {
+    pub fired: Vec<TickFired>,
+    pub skipped: Vec<(String, String)>,
 }
 
 /// Fresh envelope with a server-grade id; used by broker-emitted messages.
@@ -493,4 +682,149 @@ pub fn broker_envelope(room: &str, kind: Kind, text: &str) -> Envelope {
     env.id = new_id();
     env.ts = iso_ts_now();
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use proto::schedule::ScheduleEntry;
+
+    fn ms(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn temp_store() -> (Store, std::path::PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let db = std::env::temp_dir().join(format!(
+            "agent-bus-sched-test-{}-{}-{}.sqlite",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Store::open(&db).unwrap();
+        (store, db)
+    }
+
+    fn scheduler_agent() -> Agent {
+        Agent {
+            id: "scheduler@bus".into(),
+            harness: "scheduler".into(),
+            model: None,
+            session: None,
+            cwd: None,
+            caps: vec![],
+        }
+    }
+
+    fn entry(name: &str, cron: &str, created_ms: i64) -> ScheduleEntry {
+        ScheduleEntry {
+            name: name.into(),
+            room: "#sched".into(),
+            cron: cron.into(),
+            timezone: "UTC".into(),
+            text: "do the thing".into(),
+            payload: serde_json::json!({"files": []}),
+            enabled: true,
+            created_at_ms: created_ms,
+            last_fired_ms: None,
+        }
+    }
+
+    #[test]
+    fn schedule_crud_roundtrip() {
+        let (store, db) = temp_store();
+        let e = entry("digest", "0 8 * * *", ms(2026, 11, 8, 7, 59, 0));
+        store.add_schedule(&e).unwrap();
+
+        // Duplicate name is rejected.
+        assert!(store.add_schedule(&e).is_err());
+
+        let got = store.get_schedule("digest").unwrap().unwrap();
+        assert_eq!(got, e);
+        assert!(store.get_schedule("nope").unwrap().is_none());
+
+        let list = store.list_schedules(None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "digest");
+        assert_eq!(store.list_schedules(Some("#other")).unwrap().len(), 0);
+        assert_eq!(store.list_schedules(Some("#sched")).unwrap().len(), 1);
+
+        assert!(store.set_schedule_enabled("digest", false).unwrap());
+        assert!(!store.get_schedule("digest").unwrap().unwrap().enabled);
+        assert!(store.set_schedule_enabled("digest", true).unwrap());
+        assert!(!store.set_schedule_enabled("nope", true).unwrap());
+
+        assert!(store.remove_schedule("digest").unwrap());
+        assert!(!store.remove_schedule("digest").unwrap());
+        assert!(store.list_schedules(None).unwrap().is_empty());
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn tick_fires_once_per_minute_skips_malformed_and_respects_disabled() {
+        let (store, db) = temp_store();
+        let agent = scheduler_agent();
+        // Daily 08:00 UTC, created 07:59.
+        store
+            .add_schedule(&entry("digest", "0 8 * * *", ms(2026, 11, 8, 7, 59, 0)))
+            .unwrap();
+        // Malformed cron: must be skipped, never block the good schedule.
+        store
+            .add_schedule(&entry("broken", "not a cron", ms(2026, 11, 8, 7, 59, 0)))
+            .unwrap();
+        // Disabled schedule due at the same time: must not fire.
+        let mut off = entry("off", "0 8 * * *", ms(2026, 11, 8, 7, 59, 0));
+        off.enabled = false;
+        store.add_schedule(&off).unwrap();
+
+        // First tick at 08:00:30: digest fires once, broken is reported.
+        let out = store
+            .tick_schedules(&agent, ms(2026, 11, 8, 8, 0, 30))
+            .unwrap();
+        assert_eq!(out.fired.len(), 1);
+        assert_eq!(out.fired[0].schedule, "digest");
+        assert_eq!(out.fired[0].seq, 1);
+        assert_eq!(out.fired[0].env.kind, "task.offer");
+        assert_eq!(out.fired[0].env.from.id, "scheduler@bus");
+        assert_eq!(out.fired[0].env.text.as_deref(), Some("do the thing"));
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].0, "broken");
+        // The offer is durable in history.
+        let hist = store.history("#sched", 0, 10).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].kind, "task.offer");
+        // last_fired recorded as the occurrence time.
+        assert_eq!(
+            store.get_schedule("digest").unwrap().unwrap().last_fired_ms,
+            Some(ms(2026, 11, 8, 8, 0, 0))
+        );
+
+        // Second tick in the same minute: nothing fires again.
+        let out = store
+            .tick_schedules(&agent, ms(2026, 11, 8, 8, 0, 45))
+            .unwrap();
+        assert!(out.fired.is_empty());
+        assert_eq!(store.history("#sched", 0, 10).unwrap().len(), 1);
+
+        // Tick 91 s after the occurrence: no catch-up.
+        let out = store
+            .tick_schedules(&agent, ms(2026, 11, 8, 8, 1, 31))
+            .unwrap();
+        assert!(out.fired.is_empty());
+        assert_eq!(store.history("#sched", 0, 10).unwrap().len(), 1);
+
+        // Next day 08:00:30: fires again (new occurrence).
+        let out = store
+            .tick_schedules(&agent, ms(2026, 11, 9, 8, 0, 30))
+            .unwrap();
+        assert_eq!(out.fired.len(), 1);
+        assert_eq!(out.fired[0].seq, 2);
+        let _ = std::fs::remove_file(db);
+    }
 }

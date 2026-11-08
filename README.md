@@ -126,6 +126,7 @@ agent-bus/
 ├── tools/launcher/         ← Windows desktop control panel + installer
 ├── docs/
 │   ├── protocol.md         ← NDJSON wire protocol, envelope, kind contracts
+│   ├── scheduling.md       ← scheduled jobs: cron posts task.offer into rooms
 │   ├── architecture.md     ← components, data flow, storage
 │   ├── security.md         ← trust model, injection guard, ACLs, authn
 │   ├── references.md       ← prior art + integration targets (local ideas & web)

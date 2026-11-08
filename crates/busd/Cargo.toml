@@ -19,3 +19,4 @@ anyhow = { workspace = true }
 [dev-dependencies]
 criterion = "0.5"
 tokio-test = "0.4"
+chrono = { workspace = true }
