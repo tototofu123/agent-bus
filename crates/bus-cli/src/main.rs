@@ -1,5 +1,6 @@
 //! `bus` — the universal adapter. One-shot commands over TCP loopback NDJSON.
 
+mod telegram;
 mod watch;
 
 use anyhow::{anyhow, Context, Result};
@@ -47,6 +48,8 @@ enum Cmd {
     Watch(WatchArgs),
     /// Who is here
     Who(WhoArgs),
+    /// Bridge a Telegram chat to a room (issues #8, #12)
+    Telegram(TelegramArgs),
     /// Announce this agent is alive (presence heartbeat, issue #9)
     Heartbeat(HeartbeatArgs),
     /// List rooms
@@ -159,6 +162,40 @@ struct WhoArgs {
 struct HeartbeatArgs {
     #[arg(long)]
     agent: Option<String>,
+}
+
+#[derive(Args)]
+struct TelegramArgs {
+    /// bus room to bridge, e.g. #general
+    #[arg(long)]
+    room: String,
+    /// Telegram chat id to bridge (group id is negative)
+    #[arg(long)]
+    chat: i64,
+    /// bot token (or TELEGRAM_BOT_TOKEN, or --token-file). Never print it.
+    /// Use a dedicated bot for the bridge: one token has exactly one
+    /// getUpdates poller, so sharing the Perihel bot's token while
+    /// perihel-telegram polls with it would break both.
+    #[arg(long)]
+    token: Option<String>,
+    /// file holding the bot token (one line)
+    #[arg(long)]
+    token_file: Option<String>,
+    /// Telegram API base; only overridden in tests (mock server)
+    #[arg(long, default_value = "https://api.telegram.org")]
+    api_base: String,
+    /// bridge agent id on the bus
+    #[arg(long, default_value = "telegram@bridge")]
+    bridge_agent: String,
+    /// human sender id on the bus
+    #[arg(long, default_value = "human@telegram")]
+    human_agent: String,
+    /// long-poll seconds per getUpdates call (max 50)
+    #[arg(long, default_value_t = 25)]
+    poll_secs: u64,
+    /// seconds to wait for an agent reply before the "no reply" ack
+    #[arg(long, default_value_t = 60)]
+    reply_timeout_secs: u64,
 }
 
 #[derive(Args)]
@@ -930,6 +967,31 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("(nobody)");
                 }
             }
+        }
+        Cmd::Telegram(a) => {
+            let token = match (a.token, a.token_file) {
+                (Some(t), _) => t,
+                (None, Some(f)) => std::fs::read_to_string(&f)
+                    .with_context(|| format!("reading token file {}", f))?
+                    .trim()
+                    .to_string(),
+                (None, None) => std::env::var("TELEGRAM_BOT_TOKEN")
+                    .context("no bot token: pass --token, --token-file, or TELEGRAM_BOT_TOKEN")?,
+            };
+            if token.is_empty() {
+                return Err(anyhow!("bot token is empty"));
+            }
+            let cfg = telegram::BridgeConfig {
+                room: a.room,
+                chat_id: a.chat,
+                token,
+                api_base: a.api_base,
+                bridge_agent: a.bridge_agent,
+                human_agent: a.human_agent,
+                poll_secs: a.poll_secs.min(50),
+                reply_timeout_secs: a.reply_timeout_secs,
+            };
+            telegram::run_bridge(cfg, transport, p).await?;
         }
         Cmd::Heartbeat(a) => {
             let id = default_agent(a.agent);
