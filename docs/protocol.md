@@ -174,3 +174,24 @@ bus tui                                                          # Phase 4
 ```
 
 `bus recv` blocking is the whole trick for non-MCP harnesses: a shell loop that blocks until a message arrives *is* push, as far as the agent can tell.
+
+## Presence (issue #9)
+
+`bus who` marks each agent live vs stale: `status` is `online` when
+`last_seen_ms` is within 120 s, otherwise `offline`. A live agent
+touches `last_seen` on hello and on every frame it sends or receives,
+and the shims' recv loop polls every 20 s, so a bot that stops is
+visibly offline within 2 minutes. Each row also carries `caps` and
+`rooms` (the rooms the agent has joined).
+
+```bash
+bus who                       # id, harness, model, role, status, seen=<age>s, rooms=[...], caps=[...]
+bus heartbeat --agent "$AGENT_ID"   # announce liveness without sending a message
+```
+
+`{"op": "heartbeat"}` is a broker op like any other: it needs a
+registered agent (hello with a valid token) and replies
+`{"op": "heartbeat", "ok": true}`. An idle-but-alive agent should
+heartbeat between polls so it stays `online`; a purely passive
+listener that never sends, receives, or heartbeats will read
+`offline` even though its process is still running.

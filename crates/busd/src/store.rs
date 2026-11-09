@@ -15,6 +15,12 @@ pub struct Store {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Presence window (issue #9): last_seen within this long means online.
+/// Live agents touch last_seen on hello and on every frame; the shims'
+/// recv loop polls every 20 s, so 120 s separates live from gone with
+/// room to spare for one missed poll.
+pub const ONLINE_WINDOW_MS: i64 = 120_000;
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -206,22 +212,35 @@ impl Store {
         // two branches must bind different argument lists.
         let sql = match room {
             Some(_) => {
-                "SELECT a.id, a.harness, a.model, a.last_seen, a.role FROM agents a
+                "SELECT a.id, a.harness, a.model, a.last_seen, a.role, a.caps FROM agents a
                            JOIN members m ON m.agent = a.id WHERE m.room = ?1 ORDER BY a.id"
             }
-            None => "SELECT id, harness, model, last_seen, role FROM agents ORDER BY id",
+            None => "SELECT id, harness, model, last_seen, role, caps FROM agents ORDER BY id",
         };
         let mut stmt = conn.prepare(sql)?;
-        let row = |r: &rusqlite::Row| -> rusqlite::Result<serde_json::Value> {
-            Ok(serde_json::json!({
-                "id": r.get::<_, String>(0)?,
+        let row = |r: &rusqlite::Row| -> rusqlite::Result<(String, serde_json::Value)> {
+            let id = r.get::<_, String>(0)?;
+            let last_seen = r.get::<_, i64>(3)?;
+            let caps: Vec<String> = r
+                .get::<_, String>(5)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            Ok((id.clone(), serde_json::json!({
+                "id": id,
                 "harness": r.get::<_, String>(1)?,
                 "model": r.get::<_, Option<String>>(2)?,
-                "last_seen_ms": r.get::<_, i64>(3)?,
+                "last_seen_ms": last_seen,
+                // Presence (issue #9): an agent whose recv loop / shim is
+                // alive touches last_seen at least every ~20 s (hello and
+                // every frame), so 120 s cleanly separates live from gone.
+                // A bot that stops is visibly offline within 2 minutes.
+                "status": if now_ms() - last_seen <= ONLINE_WINDOW_MS { "online" } else { "offline" },
                 "role": r.get::<_, String>(4)?,
-            }))
+                "caps": caps,
+            })))
         };
-        let rows = match room {
+        let mut rows: Vec<(String, serde_json::Value)> = match room {
             Some(room) => {
                 let rows = stmt.query_map(params![room], row)?;
                 rows.filter_map(|r| r.ok()).collect()
@@ -231,7 +250,18 @@ impl Store {
                 rows.filter_map(|r| r.ok()).collect()
             }
         };
-        Ok(rows)
+        // Room subscriptions per agent (issue #9 roster). A second query
+        // per agent, not a join: who() is a rare admin read, and the
+        // join would duplicate rows for multi-room agents.
+        for (id, v) in rows.iter_mut() {
+            let mut stmt2 = conn.prepare("SELECT room FROM members WHERE agent=?1 ORDER BY room")?;
+            let rooms: Vec<String> = stmt2
+                .query_map(params![id.as_str()], |r| r.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            v["rooms"] = serde_json::json!(rooms);
+        }
+        Ok(rows.into_iter().map(|(_, v)| v).collect())
     }
 
     // -- rooms / membership -------------------------------------------------
@@ -825,6 +855,67 @@ mod tests {
             .unwrap();
         assert_eq!(out.fired.len(), 1);
         assert_eq!(out.fired[0].seq, 2);
+        let _ = std::fs::remove_file(db);
+    }
+
+    #[test]
+    fn who_reports_status_caps_and_rooms() {
+        // Presence (issue #9): who() marks live vs stale agents and
+        // shows caps and room subscriptions.
+        let (store, db) = temp_store();
+        let mut live = scheduler_agent();
+        live.id = "live@bus".into();
+        live.harness = "codex".into();
+        live.model = Some("gpt-x".into());
+        live.caps = vec!["search".into(), "code".into()];
+        store
+            .upsert_agent(&live, proto::Role::Conversation, None)
+            .unwrap();
+        store.join("live@bus", "#repo:agent-bus").unwrap();
+        store.join("live@bus", "#general").unwrap();
+
+        let mut stale = scheduler_agent();
+        stale.id = "stale@bus".into();
+        stale.harness = "omp".into();
+        store
+            .upsert_agent(&stale, proto::Role::Protocol, None)
+            .unwrap();
+        // Backdate last_seen past the 120 s online window.
+        {
+            let conn = store.handle();
+            let conn = conn.lock().unwrap();
+            conn.execute(
+                "UPDATE agents SET last_seen = ?1 WHERE id = 'stale@bus'",
+                params![now_ms() - ONLINE_WINDOW_MS - 1000],
+            )
+            .unwrap();
+        }
+
+        let all = store.who(None).unwrap();
+        assert_eq!(all.len(), 2);
+        let live_row = all.iter().find(|a| a["id"] == "live@bus").unwrap();
+        assert_eq!(live_row["status"], "online");
+        assert_eq!(live_row["harness"], "codex");
+        assert_eq!(live_row["model"], "gpt-x");
+        assert_eq!(live_row["caps"], serde_json::json!(["search", "code"]));
+        assert_eq!(
+            live_row["rooms"],
+            serde_json::json!(["#general", "#repo:agent-bus"])
+        );
+        let stale_row = all.iter().find(|a| a["id"] == "stale@bus").unwrap();
+        assert_eq!(stale_row["status"], "offline");
+        assert_eq!(stale_row["rooms"], serde_json::json!([]));
+
+        // Room-scoped listing only returns members of that room.
+        let scoped = store.who(Some("#general")).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0]["id"], "live@bus");
+
+        // A heartbeat brings the stale agent back online.
+        store.touch_agent("stale@bus").unwrap();
+        let again = store.who(None).unwrap();
+        let stale_row = again.iter().find(|a| a["id"] == "stale@bus").unwrap();
+        assert_eq!(stale_row["status"], "online");
         let _ = std::fs::remove_file(db);
     }
 }
