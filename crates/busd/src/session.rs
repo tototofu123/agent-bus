@@ -155,6 +155,8 @@ pub async fn handle_conn(stream: TransportStream, state: Arc<AppState>) -> Resul
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
         }                    }                    "who" => {                        if let Err(e) = op_who(&state, &msg, &mut writer).await {
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
+        }                    }                    "heartbeat" => {                        if let Err(e) = op_heartbeat(&state, &me, &mut writer).await {
+            let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
         }                    }                    "rooms" => {                        if let Err(e) = op_rooms(&state, &mut writer).await {
             let _ = write(&mut writer, &err_value("internal", e.to_string())).await;
         }                    }                    "schedule.add" => {                        if let Err(e) = op_schedule_add(&state, &me, &msg, &mut writer).await {
@@ -580,6 +582,24 @@ async fn op_who(
         &json!({"op": "who", "agents": agents, "count": agents.len()}),
     )
     .await?;
+    Ok(())
+}
+/// Presence heartbeat (issue #9): a registered agent announces it is
+/// alive without sending a message. The recv loop / shim calls this
+/// between polls so an idle-but-alive agent stays "online" in `who`.
+/// Unregistered callers get the same auth error as any other op that
+/// needs an identity.
+async fn op_heartbeat(
+    state: &AppState,
+    me: &Option<Agent>,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    let Some(agent) = me else {
+        write(writer, &err_value("auth", "heartbeat requires a registered agent")).await?;
+        return Ok(());
+    };
+    state.store.touch_agent(&agent.id)?;
+    write(writer, &json!({"op": "heartbeat", "ok": true})).await?;
     Ok(())
 }
 async fn op_rooms(state: &AppState, writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {

@@ -47,6 +47,8 @@ enum Cmd {
     Watch(WatchArgs),
     /// Who is here
     Who(WhoArgs),
+    /// Announce this agent is alive (presence heartbeat, issue #9)
+    Heartbeat(HeartbeatArgs),
     /// List rooms
     Rooms,
     /// Replay a room from a cursor
@@ -151,6 +153,12 @@ struct WatchArgs {
 struct WhoArgs {
     #[arg(long)]
     room: Option<String>,
+}
+
+#[derive(Args)]
+struct HeartbeatArgs {
+    #[arg(long)]
+    agent: Option<String>,
 }
 
 #[derive(Args)]
@@ -866,18 +874,75 @@ async fn run(cli: Cli) -> Result<()> {
             c.bye().await;
             if let Some(agents) = reply.get("agents").and_then(|a| a.as_array()) {
                 for a in agents {
+                    // last_seen_ms is server time; the CLI clock is the
+                    // same machine in practice (local broker), so the
+                    // age below is approximate, not exact.
+                    let seen_age_s = a
+                        .get("last_seen_ms")
+                        .and_then(|s| s.as_i64())
+                        .map(|ms| {
+                            (std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(ms)
+                                - ms)
+                                .max(0)
+                                / 1000
+                        })
+                        .unwrap_or(0);
+                    let rooms = a
+                        .get("rooms")
+                        .and_then(|r| r.as_array())
+                        .map(|rs| {
+                            rs.iter()
+                                .filter_map(|r| r.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
+                    let caps = a
+                        .get("caps")
+                        .and_then(|c| c.as_array())
+                        .map(|cs| {
+                            cs.iter()
+                                .filter_map(|c| c.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_default();
                     println!(
-                        "{:<28} {:<12} {:<22} role={}",
+                        "{:<28} {:<12} {:<22} role={:<12} {:<8} seen={}s rooms=[{}]{}",
                         a.get("id").and_then(|i| i.as_str()).unwrap_or("?"),
                         a.get("harness").and_then(|h| h.as_str()).unwrap_or("?"),
                         a.get("model").and_then(|m| m.as_str()).unwrap_or("-"),
                         a.get("role").and_then(|r| r.as_str()).unwrap_or("?"),
+                        a.get("status").and_then(|s| s.as_str()).unwrap_or("?"),
+                        seen_age_s,
+                        rooms,
+                        if caps.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" caps=[{caps}]")
+                        },
                     );
                 }
                 if agents.is_empty() {
                     println!("(nobody)");
                 }
             }
+        }
+        Cmd::Heartbeat(a) => {
+            let id = default_agent(a.agent);
+            let agent = make_agent(&id, "bus-cli", None, &[], None);
+            let token = read_token(&id);
+            c.hello(Some(&agent), token.as_deref()).await?;
+            let reply = c.op(json!({"op": "heartbeat"})).await?;
+            c.bye().await;
+            println!(
+                "heartbeat {} ok={}",
+                id,
+                reply.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)
+            );
         }
         Cmd::Rooms => {
             c.hello(None, None).await?;
