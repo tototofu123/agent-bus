@@ -167,6 +167,7 @@ bus join "#repo:$(basename "$PWD")"
 bus send --room "#task:x" --kind task.offer --text "…" --payload '{"files":["src/**"]}'
 bus recv --as "$AGENT_ID" --room "#repo:x" --timeout 30 --format json   # blocking = push
 bus tail --room "#repo:x" --kinds chat,status
+bus listen --room "#repo:x" --exec "my-responder"        # answer messages
 bus who  --room "#repo:x"
 bus telegram --room "#general" --chat -5312549577   # bridge a Telegram chat to a room (docs/telegram.md)
 bus history --room "#task:y" --since 40 --full

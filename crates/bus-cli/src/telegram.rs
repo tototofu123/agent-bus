@@ -440,6 +440,16 @@ impl TgClient {
         Ok(())
     }
 
+    /// The bot's own username, for stripping the wake-word @mention
+    /// from group text. Empty string when Telegram does not report one.
+    pub async fn get_me_username(&self) -> Result<String> {
+        let v: serde_json::Value = self.post("getMe", serde_json::json!({})).await?;
+        Ok(v.get("username")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
     pub async fn send_chat_action(&self, chat_id: i64) -> Result<()> {
         let _: serde_json::Value = self
             .post(
@@ -449,6 +459,34 @@ impl TgClient {
             .await?;
         Ok(())
     }
+}
+
+/// Remove the bot's own `@username` from group text. Telegram includes
+/// it when a human addresses the bot to wake it; the agents behind the
+/// bus should see the question, not the wake word. (Ported from the
+/// #13 mention-routing work.)
+fn strip_self_mention(text: &str, username: &str) -> String {
+    let needle = format!("@{}", username.to_ascii_lowercase());
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut search = 0usize;
+    while let Some(pos) = lower[search..].find(&needle) {
+        let at = search + pos;
+        let end = at + needle.len();
+        let boundary = text[end..]
+            .chars()
+            .next()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        if boundary {
+            out.push_str(&text[last..at]);
+            last = end;
+        }
+        search = end;
+    }
+    out.push_str(&text[last..]);
+    out.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -481,8 +519,9 @@ async fn connect_as(
     transport: &Transport,
     port: u16,
     id: &str,
+    harness: &str,
 ) -> Result<Client> {
-    let agent = make_agent(id, "telegram-bridge", None, &[], None);
+    let agent = make_agent(id, harness, None, &[], None);
     let mut c = transport.connect(port).await?;
     let existing = read_token(id);
     if existing.is_none() {
@@ -519,11 +558,17 @@ async fn connect_as(
 /// Run the bridge until Ctrl-C. One process, one token, one poller.
 pub async fn run_bridge(cfg: BridgeConfig, transport: Transport, port: u16) -> Result<()> {
     let tg = TgClient::new(&cfg.api_base, &cfg.token);
+    // The bot's own @username, so group messages that wake it
+    // ("@perihelcloudbot what is X") reach the room as the question.
+    // Best effort: without it the text just keeps the mention.
+    let bot_username = tg.get_me_username().await.unwrap_or_default();
     // Two bus connections: the bridge agent reads (who/history) and the
     // human agent posts. The bus takes the sender from hello, so one
-    // connection cannot post as both.
-    let mut bus = connect_as(&transport, port, &cfg.bridge_agent).await?;
-    let mut human = connect_as(&transport, port, &cfg.human_agent).await?;
+    // connection cannot post as both. The human agent's harness is
+    // "telegram" (not "telegram-bridge") so `bus listen --only-human`
+    // recognises its messages as a human surface.
+    let mut bus = connect_as(&transport, port, &cfg.bridge_agent, "telegram-bridge").await?;
+    let mut human = connect_as(&transport, port, &cfg.human_agent, "telegram").await?;
     bus.op(serde_json::json!({"op": "join", "room": cfg.room})).await?;
     human
         .op(serde_json::json!({"op": "join", "room": cfg.room}))
@@ -564,8 +609,18 @@ pub async fn run_bridge(cfg: BridgeConfig, transport: Transport, port: u16) -> R
             let Some(text) = msg.text.as_ref().filter(|t| !t.trim().is_empty()) else {
                 continue;
             };
+            // In a group, drop the bot's own @username: the agents
+            // behind the bus should see the question, not the wake word.
+            let clean = if !bot_username.is_empty() && msg.chat.id < 0 {
+                strip_self_mention(text, &bot_username)
+            } else {
+                text.to_string()
+            };
+            if clean.trim().is_empty() {
+                continue;
+            }
             if let Err(e) =
-                handle_message(&tg, &mut bus, &mut human, &cfg, &msg, &text).await
+                handle_message(&tg, &mut bus, &mut human, &cfg, &msg, &clean).await
             {
                 eprintln!("bus telegram: message {} failed ({e:#})", msg.message_id);
             }
@@ -746,6 +801,28 @@ mod tests {
         let html = render_markdown("hi there");
         let chunks = chunk_html(&html);
         assert_eq!(chunks, vec!["hi there".to_string()]);
+    }
+
+    #[test]
+    fn self_mention_is_stripped_from_group_text() {
+        assert_eq!(
+            strip_self_mention("@perihelcloudbot what is the weather?", "perihelcloudbot"),
+            "what is the weather?"
+        );
+        assert_eq!(
+            strip_self_mention("@PerihelCloudBot hi", "perihelcloudbot"),
+            "hi"
+        );
+        // A longer handle that merely starts with the bot name is not a mention.
+        assert_eq!(
+            strip_self_mention("@perihelcloudbotx nope", "perihelcloudbot"),
+            "@perihelcloudbotx nope"
+        );
+        // Mentions of other agents stay.
+        assert_eq!(
+            strip_self_mention("@omp what is this", "perihelcloudbot"),
+            "@omp what is this"
+        );
     }
 }
 

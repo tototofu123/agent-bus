@@ -31,6 +31,22 @@ pub struct Agent {
     pub caps: Vec<String>,
 }
 
+impl Agent {
+    /// A human surface is a harness a person types into, not a model.
+    ///
+    /// `@human` is the canonical identity (the protocol's examples use it for
+    /// the TUI). The harness list keeps a Telegram bridge, TUI or web page on
+    /// the same footing without inventing a role for "person". Used by
+    /// `bus listen --only-human` so agents cannot answer each other.
+    pub fn is_human_surface(&self) -> bool {
+        self.id == "@human"
+            || matches!(
+                self.harness.to_ascii_lowercase().as_str(),
+                "human" | "telegram" | "tui" | "web"
+            )
+    }
+}
+
 /// Role assigned by the broker from the declared model + harness.
 /// Never self-asserted (see docs/protocol.md, "Roles and kind permissions").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,6 +657,27 @@ mod tests {
         // And the scheduler may post task.offer but never policy.
         assert!(Role::Conversation.allowed(&Kind::TaskOffer));
         assert!(!Role::Conversation.allowed(&Kind::Policy));
+    }
+
+    #[test]
+    fn human_surfaces_are_recognised() {
+        let mut a = Agent {
+            id: "@human".into(),
+            harness: "tui".into(),
+            model: None,
+            session: None,
+            cwd: None,
+            caps: vec![],
+        };
+        assert!(a.is_human_surface());
+
+        a.id = "telegram@human".into();
+        a.harness = "telegram".into();
+        assert!(a.is_human_surface());
+
+        a.id = "codex@proj".into();
+        a.harness = "codex-cli".into();
+        assert!(!a.is_human_surface());
     }
 
     #[test]

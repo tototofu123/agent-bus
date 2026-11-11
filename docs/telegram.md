@@ -67,13 +67,72 @@ bus telegram --room "#general" --chat -5312549577 `
 Telegram server). On a restart the bridge skips the unconfirmed
 backlog, so it never re-posts old messages.
 
-## What it is not
+## Answering with `bus listen`
 
 The bridge is a transport, not a model: it does not answer anything
 itself. Replies come from whichever agents are joined to the room
 (`bus who --room "#general"` shows who is listening). To have a
 specific agent answer, join it to the room — for example the shims in
 `shims/` auto-join codex and claude-code sessions to their repo
-rooms. A `bus listen --room … --exec …` responder that pipes every
-message to a command is a possible follow-up, not part of this
-bridge.
+rooms. Or run a responder:
+
+```powershell
+bus listen --room "#general" --exec "my-responder"
+```
+
+`listen` tails the room and, for each new message, runs the command
+with the message text on stdin and the envelope as environment
+variables (`AGENT_BUS_ROOM`, `AGENT_BUS_SEQ`, `AGENT_BUS_FROM`,
+`AGENT_BUS_KIND`, `AGENT_BUS_ID`, plus `AGENT_BUS_BIN` and
+`AGENT_BUS_PORT` so the handler can reach the same broker). Whatever
+the handler prints on stdout becomes the reply (trimmed, capped at
+16,000 chars, sent back as a `chat` with `reply_to`); a non-zero
+exit or empty stdout sends nothing. The handler is a normal process,
+so any model, script or CLI can answer — nothing about `listen` is
+Telegram-specific, so the same listener serves the TUI, a web page,
+or any other human surface.
+
+In a group, several listeners can share a room. Each one answers
+only when mentioned by name:
+
+```powershell
+bus listen --room "#general" --agent assistant@bus --exec "my-responder" `
+  --mention-only --default
+```
+
+`--mention-only` answers only messages that mention `@assistant`
+(the handle defaults to the agent id before `@`, `--name` overrides
+it). `--default` also answers messages that mention nobody, so a
+bare question reaches the default agent instead of nobody. Mentions
+are `@name` tokens at a word boundary (`user@example.com` is not a
+mention); the leading `@name` is stripped before the text reaches
+the handler. `--only-human` answers only messages from human
+surfaces (the Telegram bridge posts as one), so agents in a shared
+room never answer each other in a loop. The listener never answers
+its own replies.
+
+Two working responders ship in [`tools/`](../tools/):
+
+- [`nvidia-responder.ps1`](../tools/nvidia-responder.ps1) — answers
+  with an NVIDIA-hosted model (key from `$env:NVIDIA_API_KEY` or
+  `~/.agent-bus/nvidia.token`; default model `z-ai/glm-5.3-flash`).
+  Run it with
+  `bus listen --room '#repo:agent-bus' --exec 'powershell -NoProfile -ExecutionPolicy Bypass -File tools\nvidia-responder.ps1'`.
+- [`omp-responder.ps1`](../tools/omp-responder.ps1) — runs `omp -p`
+  with the room as context, so an OpenHands-style agent answers.
+
+The listener registers as `listener@bus` by default (`--agent` to
+change it), with harness `bus-listen` and cap `respond`. `--timeout`
+(seconds, default 120) kills a handler that runs too long;
+`--once` handles one message, then exits (handy for smoke tests).
+
+The bridge strips its own `@username` from group text before
+posting to the room, so a message that wakes the bot
+("@perihelcloudbot what is the weather?") reaches the listeners as
+just the question.
+
+## What it is not
+
+The bridge is a transport, not a model: it does not answer anything
+itself. Replies come from whichever agents are joined to the room
+(`bus who --room "#general"` shows who is listening).
