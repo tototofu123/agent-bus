@@ -1,5 +1,6 @@
 //! `bus` — the universal adapter. One-shot commands over TCP loopback NDJSON.
 
+mod listen;
 mod telegram;
 mod watch;
 
@@ -50,6 +51,8 @@ enum Cmd {
     Who(WhoArgs),
     /// Bridge a Telegram chat to a room (issues #8, #12)
     Telegram(TelegramArgs),
+    /// Answer room messages by running a command per message (PR #11)
+    Listen(ListenArgs),
     /// Announce this agent is alive (presence heartbeat, issue #9)
     Heartbeat(HeartbeatArgs),
     /// List rooms
@@ -162,6 +165,79 @@ struct WhoArgs {
 struct HeartbeatArgs {
     #[arg(long)]
     agent: Option<String>,
+}
+
+#[derive(Args)]
+struct ListenArgs {
+    /// room to answer in
+    #[arg(long)]
+    room: String,
+    /// command run per message: text on stdin, stdout becomes the reply
+    #[arg(long)]
+    exec: String,
+    /// bus identity the listener registers and replies as
+    #[arg(long, default_value = "listener@bus")]
+    agent: String,
+    /// comma-separated kinds to answer (default chat)
+    #[arg(long, value_delimiter = ',', default_value = "chat")]
+    kinds: Vec<String>,
+    /// kind used for the reply
+    #[arg(long, default_value = "chat")]
+    reply_kind: String,
+    /// model to advertise on the listener's identity
+    #[arg(long)]
+    model: Option<String>,
+    /// seconds a handler may run before it is killed
+    #[arg(long, default_value_t = 120)]
+    timeout: u64,
+    /// handle one message, then exit
+    #[arg(long)]
+    once: bool,
+    /// @mention handle (default: agent id before @)
+    #[arg(long)]
+    name: Option<String>,
+    /// only answer messages that mention @name
+    #[arg(long)]
+    mention_only: bool,
+    /// with --mention-only, also answer messages that mention nobody
+    #[arg(long)]
+    default: bool,
+    /// only answer human surfaces, so agents do not answer each other
+    #[arg(long)]
+    only_human: bool,
+}
+
+/// Register `agent` if it has no token yet (idempotent: re-registering
+/// with the stored token keeps the same identity). Shared by `listen`
+/// and any other long-running command that must exist before it hellos.
+pub(crate) async fn ensure_registered(
+    transport: &Transport,
+    port: u16,
+    agent: &Agent,
+) -> Result<()> {
+    let existing = read_token(&agent.id);
+    let mut c = transport.connect(port).await?;
+    c.hello(None, None).await?;
+    let mut v = json!({"op": "register", "agent": agent});
+    if let Some(t) = &existing {
+        v["token"] = t.as_str().into();
+    }
+    let reply = c.op(v).await?;
+    c.bye().await;
+    if let Some(token) = reply.get("token").and_then(|t| t.as_str()) {
+        let path = token_path(&agent.id);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, token)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        eprintln!("registered {} token stored", agent.id);
+    }
+    Ok(())
 }
 
 #[derive(Args)]
@@ -600,6 +676,29 @@ async fn run(cli: Cli) -> Result<()> {
         prefer: cli.transport.clone(),
         pipe: cli.pipe.clone(),
     };
+    // `listen` runs its own loop on its own connection, so it never
+    // takes the one-shot path below.
+    if let Cmd::Listen(a) = &cli.cmd {
+        return listen::run(
+            listen::Config {
+                room: a.room.clone(),
+                exec: a.exec.clone(),
+                agent: a.agent.clone(),
+                model: a.model.clone(),
+                kinds: a.kinds.clone(),
+                reply_kind: a.reply_kind.clone(),
+                timeout_s: a.timeout,
+                once: a.once,
+                name: a.name.clone(),
+                mention_only: a.mention_only,
+                default_reply: a.default,
+                only_human: a.only_human,
+            },
+            p,
+            transport,
+        )
+        .await;
+    }
     let mut c = transport.connect(p).await?;
 
     match cli.cmd {
@@ -1195,6 +1294,7 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        Cmd::Listen(_) => unreachable!("listen handled before connecting"),
     }
     Ok(())
 }
